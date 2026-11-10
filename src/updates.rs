@@ -305,6 +305,7 @@ impl Checks {
             &format!("DirectCut RS {}", display_version(VERSION)),
         );
         Label::new(column, "By Nick Giannak III");
+        Label::new(column, "Contributions by Derek Lane.");
         Label::new(column, "Made exclusively with artificial intelligence.");
         Label::new(column, "Copyright © 2026 Nick Giannak III");
         Label::new(column, "Released under the MIT License.");
@@ -327,7 +328,7 @@ impl Checks {
             check,
             status,
         }));
-        window.set_size(435, 245);
+        window.set_size(435, 275);
         Timer::once(1, move || check.focus());
         window.run_modal(Some(self.launcher));
         self.about.set(None);
@@ -512,7 +513,7 @@ impl Dialog {
             Job::spawn(true, move |cancel, events| {
                 let prepared = update.updater.prepare(
                     update.candidate.clone(),
-                    &std::env::temp_dir(),
+                    &crate::paths::update_work(),
                     cancel,
                     &mut |event| {
                         events(match event {
