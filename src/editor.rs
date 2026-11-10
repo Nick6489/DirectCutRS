@@ -9,7 +9,7 @@ use std::{
 use rungui::*;
 
 use crate::{
-    Clipboard,
+    OpenDocument, Session,
     audio::{self, Playback},
     mp3::{self, Format, Frames, Result},
 };
@@ -46,7 +46,8 @@ struct Editor {
     next_revision: u64,
     saved_revision: u64,
     playback: Option<Playback>,
-    clipboard: Clipboard,
+    session: Session,
+    _open_document: OpenDocument,
     save: Option<Receiver<(PathBuf, u64, Result<()>)>>,
 }
 
@@ -77,17 +78,17 @@ enum Command {
     Help,
 }
 
-pub fn choose_files(parent: Window, clipboard: &Clipboard) {
+pub fn choose_files(parent: Window, session: &Session) {
     let paths = FileDialog::new()
         .title("Open MP3 files")
         .filter("MP3 audio", &["mp3"])
         .open_many(Some(parent));
     for path in paths {
-        open_file(parent, path, clipboard);
+        open_file(parent, path, session);
     }
 }
 
-pub fn open_file(parent: Window, path: PathBuf, clipboard: &Clipboard) {
+pub fn open_file(parent: Window, path: PathBuf, session: &Session) {
     let (sender, receiver) = mpsc::channel();
     let input = path.clone();
     let started = std::thread::Builder::new()
@@ -105,7 +106,8 @@ pub fn open_file(parent: Window, path: PathBuf, clipboard: &Clipboard) {
         );
         return;
     }
-    let clipboard = clipboard.clone();
+    let session = session.clone();
+    let mut document = Some(session.opening_document());
     let timer = Rc::new(std::cell::Cell::new(None::<Timer>));
     let handle = Timer::every(50, {
         let timer = timer.clone();
@@ -119,9 +121,14 @@ pub fn open_file(parent: Window, path: PathBuf, clipboard: &Clipboard) {
                 timer.stop();
             }
             match result {
-                Ok((format, frames, recovery)) => {
-                    create(path.clone(), format, frames, recovery, clipboard.clone())
-                }
+                Ok((format, frames, recovery)) => create(
+                    path.clone(),
+                    format,
+                    frames,
+                    recovery,
+                    session.clone(),
+                    document.take().unwrap(),
+                ),
                 Err(error) => show_error(
                     parent,
                     &format!("Could not open {}. {error}", path.display()),
@@ -154,7 +161,8 @@ fn create(
     format: Format,
     frames: Frames,
     recovery: mp3::Recovery,
-    clipboard: Clipboard,
+    session: Session,
+    open_document: OpenDocument,
 ) {
     let window = Window::new("DirectCut RS");
     let column = VBox::new(window);
@@ -191,7 +199,8 @@ fn create(
         next_revision: 1,
         saved_revision: 0,
         playback: None,
-        clipboard,
+        session,
+        _open_document: open_document,
         save: None,
     }));
     let timer = Timer::every(75, {
@@ -266,8 +275,8 @@ fn create(
                     }
                 }
                 Open => {
-                    let clipboard = editor.borrow().clipboard.clone();
-                    choose_files(window, &clipboard);
+                    let session = editor.borrow().session.clone();
+                    choose_files(window, &session);
                 }
                 _ => {
                     let result = editor.borrow_mut().run(command);
@@ -556,7 +565,7 @@ impl Editor {
             Cut | Copy | Delete => {
                 let range = self.edit.selection()?;
                 if !matches!(command, Delete) {
-                    *self.clipboard.borrow_mut() =
+                    *self.session.clipboard.borrow_mut() =
                         Some((self.format, self.edit.frames[range.clone()].to_vec()));
                     self.activity = "Copied selection to the DirectCut clipboard.".into();
                 }
@@ -572,6 +581,7 @@ impl Editor {
             }
             Paste => {
                 let (format, frames) = self
+                    .session
                     .clipboard
                     .borrow()
                     .clone()
