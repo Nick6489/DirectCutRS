@@ -19,6 +19,7 @@ tempfile = "3.27.0"
 [target.'cfg(windows)'.dependencies]
 base64 = "0.22"
 freshen = { git = "https://github.com/Nick6489/freshen.git", rev = "778a649e17c7c5d71e01ea45e30ca805a14008f5" }
+pulldown-cmark = { version = "0.13", default-features = false }
 url = { version = "2", optional = true }
 windows = { version = "0.54", features = [
   "implement",

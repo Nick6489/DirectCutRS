@@ -3,13 +3,15 @@ param(
     [Parameter(Mandatory)]
     [string] $FreshenRelease,
     [Parameter(Mandatory)]
-    [string] $SigningKey
+    [string] $SigningKey,
+    [string] $ReleaseNotes
 )
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $freshen = (Resolve-Path -LiteralPath $FreshenRelease).Path
 $key = (Resolve-Path -LiteralPath $SigningKey).Path
+$notes = if ($ReleaseNotes) { Get-Content -Raw -Encoding utf8 -LiteralPath $ReleaseNotes }
 $root = Split-Path -Parent $PSScriptRoot
 $target = 'x86_64-pc-windows-msvc'
 
@@ -33,6 +35,11 @@ try {
     Copy-Item -LiteralPath $exe -Destination $payload
     $url = "https://github.com/Nick6489/DirectCutRS/releases/download/v$version/$zipName"
     & $freshen pack $payload $zip $url $Target files directcut-rs $version stable $manifest
+    if ($ReleaseNotes) {
+        $document = Get-Content -Raw -Encoding utf8 -LiteralPath $manifest | ConvertFrom-Json
+        $document.notes = [string]$notes
+        $document | ConvertTo-Json -Depth 32 | Set-Content -Encoding utf8NoBOM -LiteralPath $manifest
+    }
     & $freshen sign $key $manifest $signature
     Get-Item -LiteralPath $zip, $manifest, $signature
 } finally {

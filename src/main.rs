@@ -44,6 +44,11 @@ fn main() -> ExitCode {
     let layout = VBox::new(start);
     layout.set_padding(16);
     layout.set_spacing(12);
+    #[cfg(windows)]
+    let update_status = updates::restarted_for_update().then(|| {
+        announce::attach(start);
+        Label::new(layout, "")
+    });
     let open = Button::new(layout, "&Open Audio...");
     let about = Button::new(layout, "&About...");
 
@@ -116,8 +121,11 @@ fn main() -> ExitCode {
     #[cfg(windows)]
     Timer::once(updates::CONFIRM_DELAY_MS, move || {
         if start.is_alive() {
-            updates::confirm_startup(start);
-            checks.start(false);
+            if let Some(status) = update_status {
+                updates::confirm_startup(start, status);
+            } else {
+                checks.start(false);
+            }
         }
     });
 

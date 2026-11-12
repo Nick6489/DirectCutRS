@@ -1,3 +1,6 @@
+#[path = "release_notes.rs"]
+mod release_notes;
+
 use std::{
     cell::{Cell, RefCell},
     ffi::OsString,
@@ -94,21 +97,63 @@ fn updater() -> freshen::Result<Updater<UpdateTransport>> {
     })
 }
 
-pub fn confirm_startup(window: Window) {
-    if std::env::var_os("FRESHEN_CONFIRM_TOKEN").is_none() {
-        return;
-    }
-    if let Err(error) = installation_root().and_then(|root| freshen::confirm_startup(&root)) {
-        message_box(
-            Some(window),
-            MessageKind::Error,
-            Buttons::Ok,
-            "Update confirmation",
-            &format!(
-                "DirectCut RS could not confirm startup. {}",
-                update_error(&error)
+pub fn restarted_for_update() -> bool {
+    std::env::var_os("FRESHEN_CONFIRM_TOKEN").is_some()
+}
+
+pub fn confirm_startup(window: Window, status: Label) {
+    let show_result = move |result: freshen::Result<()>| {
+        if !window.is_alive() {
+            return;
+        }
+        let message = match result {
+            Ok(()) => format!(
+                "Update complete. DirectCut RS {} is ready.",
+                display_version(VERSION)
             ),
-        );
+            Err(error) => format!("Could not confirm the update. {}", update_error(&error)),
+        };
+        status.set_text(&message);
+        crate::announce::announce(window, &message);
+    };
+    if let Err(error) = thread::Builder::new()
+        .name("DirectCut RS update confirmation".into())
+        .spawn(move || {
+            let result = confirm_installation();
+            App::post(move || show_result(result));
+        })
+    {
+        show_result(Err(error.into()));
+    }
+}
+
+fn confirm_installation() -> freshen::Result<()> {
+    use std::time::{Duration, Instant};
+
+    let root = installation_root()?;
+    if !freshen::confirm_startup(&root)? {
+        return Err(freshen::Error::Helper(
+            "Freshen did not accept the startup confirmation.".into(),
+        ));
+    }
+
+    // Acknowledging startup releases the helper to commit. Only its journal
+    // can tell us when that final step has actually completed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = freshen::installation_status(&root)? {
+            match status.state {
+                InstallState::Committed if status.version == VERSION => return Ok(()),
+                InstallState::AwaitingConfirmation => {}
+                _ => return Err(freshen::Error::Recovery(status.detail)),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(freshen::Error::Helper(
+                "Freshen did not report a completed installation.".into(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -132,6 +177,7 @@ enum Progress {
 }
 
 struct Status {
+    label: Label,
     text: TextInput,
     bar: ProgressBar,
     progress: Cell<Progress>,
@@ -139,15 +185,18 @@ struct Status {
 
 impl Status {
     fn new(column: VBox) -> Self {
-        Label::new(column, "Update status");
-        // Win32 multiline edits can consume Tab even when read-only.
+        let label = Label::new(column, "Update status");
         let text = TextInput::new(column);
         text.set_a11y_name("Update status");
         text.set_read_only(true);
         text.set_min_size(460, 24);
         let bar = ProgressBar::new(column);
         bar.set_a11y_name("Update progress");
+        label.set_visible(false);
+        text.set_visible(false);
+        bar.set_visible(false);
         Self {
+            label,
             text,
             bar,
             progress: Cell::new(Progress::Idle),
@@ -158,6 +207,9 @@ impl Status {
         if self.text.text() != text {
             self.text.set_text(text);
         }
+        self.label.set_visible(true);
+        self.text.set_visible(true);
+        self.bar.set_visible(progress != Progress::Idle);
         let previous = self.progress.replace(progress);
         if previous == progress {
             return;
@@ -258,19 +310,13 @@ pub fn display_version(version: &str) -> &str {
     version.strip_suffix(".0").unwrap_or(version)
 }
 
-#[derive(Clone, Copy)]
-struct About {
-    window: Window,
-    check: Button,
-    status: Label,
-}
-
 pub struct Checks {
     launcher: Window,
     launcher_open: Button,
     launcher_about: Button,
     documents: Rc<Cell<usize>>,
-    about: Cell<Option<About>>,
+    about: Cell<Option<crate::dialogs::AboutDialog>>,
+    about_update: RefCell<Option<Update>>,
     running: Cell<bool>,
     manual: Cell<bool>,
     pub file_picker_open: Cell<bool>,
@@ -289,6 +335,7 @@ impl Checks {
             launcher_about,
             documents,
             about: Cell::new(None),
+            about_update: RefCell::new(None),
             running: Cell::new(false),
             manual: Cell::new(false),
             file_picker_open: Cell::new(false),
@@ -296,47 +343,36 @@ impl Checks {
     }
 
     pub fn about(self: &Rc<Self>) {
-        let window = Window::new("About DirectCut RS");
-        let column = VBox::new(window);
-        column.set_padding(16);
-        column.set_spacing(8);
-        Label::new(
-            column,
-            &format!("DirectCut RS {}", display_version(VERSION)),
+        let text = format!(
+            "DirectCut RS {}\r\nBy Nick Giannak III\r\nContributions by Derek Lane.\r\nMade exclusively with artificial intelligence.\r\nCopyright © 2026 Nick Giannak III\r\nReleased under the MIT License.",
+            display_version(VERSION)
         );
-        Label::new(column, "By Nick Giannak III");
-        Label::new(column, "Contributions by Derek Lane.");
-        Label::new(column, "Made exclusively with artificial intelligence.");
-        Label::new(column, "Copyright © 2026 Nick Giannak III");
-        Label::new(column, "Released under the MIT License.");
-        let status = Label::new(column, "");
-        let row = HBox::new(column);
-        row.set_spacing(8);
-        let check = Button::new(row, "Check for &updates");
-        let close = Button::new(row, "&Close");
-        check.on_click({
-            let checks = self.clone();
-            move || {
-                status.set_text("Checking for updates...");
-                checks.start(true);
-            }
-        });
-        close.on_click(move || window.hide());
-        window.on_cancel(move || window.hide());
-        self.about.set(Some(About {
-            window,
-            check,
-            status,
-        }));
-        window.set_size(435, 275);
-        Timer::once(1, move || check.focus());
-        window.run_modal(Some(self.launcher));
+        let opened = crate::dialogs::show_about(
+            self.launcher,
+            &text,
+            |dialog| self.about.set(Some(dialog)),
+            || self.start(true),
+        );
         self.about.set(None);
         self.manual.set(false);
-        if window.is_alive() {
-            window.destroy();
+        if !opened {
+            message_box(
+                Some(self.launcher),
+                MessageKind::Error,
+                Buttons::Ok,
+                "About DirectCut RS",
+                "Could not open the About dialog.",
+            );
         }
-        if self.launcher_about.is_alive() {
+        let update = self.about_update.borrow_mut().take();
+        if let Some(update) = update {
+            show(
+                self.launcher,
+                self.launcher_about,
+                self.documents.clone(),
+                update,
+            );
+        } else if self.launcher_about.is_alive() {
             self.launcher_about.focus();
         }
     }
@@ -385,40 +421,37 @@ impl Checks {
     fn complete(&self, result: freshen::Result<Option<Update>>) {
         self.running.set(false);
         let manual = self.manual.replace(false);
-        let about = self.about.get().filter(|about| about.window.is_alive());
+        let about = self.about.get();
         if let Some(about) = about {
-            about.status.set_text("");
+            about.set_status("");
         }
         if !self.launcher.is_alive() {
             return;
         }
         match result {
             Ok(Some(update)) => {
-                let (parent, focus) = about.map_or((self.launcher, self.launcher_open), |about| {
-                    (about.window, about.check)
-                });
-                show(parent, focus, self.documents.clone(), update);
+                if let Some(about) = about {
+                    self.about_update.replace(Some(update));
+                    about.close();
+                } else {
+                    show(
+                        self.launcher,
+                        self.launcher_open,
+                        self.documents.clone(),
+                        update,
+                    );
+                }
             }
             result if manual => {
                 if let Some(about) = about {
-                    let (kind, text) = match result {
-                        Ok(_) => (
-                            MessageKind::Info,
-                            "You have the latest available version.".into(),
-                        ),
+                    let (error, text) = match result {
+                        Ok(_) => (false, "You have the latest available version.".into()),
                         Err(error) => (
-                            MessageKind::Error,
+                            true,
                             format!("Could not check for updates. {}", update_error(&error)),
                         ),
                     };
-                    message_box(
-                        Some(about.window),
-                        kind,
-                        Buttons::Ok,
-                        "DirectCut RS updates",
-                        &text,
-                    );
-                    about.check.focus();
+                    about.show_update_result(&text, error);
                 }
             }
             _ => {}
@@ -591,20 +624,21 @@ fn show(parent: Window, return_focus: Button, documents: Rc<Cell<usize>>, update
     let column = VBox::new(window);
     column.set_padding(14);
     column.set_spacing(8);
-    Label::new(
-        column,
-        &format!("Installed version {}", display_version(VERSION)),
-    );
     let available = update.candidate.release().version.to_string();
-    Label::new(
-        column,
-        &format!("DirectCut RS {} is available.", display_version(&available)),
-    );
+    Label::new(column, "Release notes");
+    let notes = TextArea::new(column);
+    notes.set_a11y_name("Release notes");
+    notes.set_read_only(true);
+    notes.set_min_size(450, 155);
+    notes.set_expand(1.0);
+    notes.set_text(&format!(
+        "DirectCut RS {} is available. You are running version {}.\r\n\r\n{}",
+        display_version(&available),
+        display_version(VERSION),
+        release_notes::format_history(update.candidate.release_history()),
+    ));
+    crate::editkeys::allow_tab_to_escape(&notes);
     let status = Status::new(column);
-    status.show(
-        "Choose Install update to download and restart DirectCut RS.",
-        Progress::Idle,
-    );
     let row = HBox::new(column);
     row.set_spacing(8);
     let primary = Button::new(row, "&Install update");
@@ -639,9 +673,8 @@ fn show(parent: Window, return_focus: Button, documents: Rc<Cell<usize>>, update
         move || dialog.borrow_mut().request_close()
     });
     let timer = Timer::every(100, move || dialog.borrow_mut().poll());
-    window.set_size(515, 240);
-    // Defer focus until the modal window is visible.
-    Timer::once(1, move || primary.focus());
+    window.set_size(570, 410);
+    Timer::once(1, move || notes.focus());
     window.run_modal(Some(parent));
     timer.stop();
     if window.is_alive() {
@@ -737,23 +770,18 @@ pub fn run_helper(args: Vec<OsString>) -> ExitCode {
                 }
                 Ok(outcome) => outcome,
             };
-            let exit = if matches!(&outcome, Ok(true)) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            };
-            finished.set(Some(exit));
+            if matches!(&outcome, Ok(true)) {
+                finished.set(Some(ExitCode::SUCCESS));
+                window.hide();
+                App::quit();
+                return;
+            }
+            finished.set(Some(ExitCode::FAILURE));
             match freshen::installation_status(&root)
                 .ok()
                 .flatten()
                 .map(|status| status.state)
             {
-                Some(InstallState::Committed) if matches!(outcome, Ok(true)) => {
-                    status.show(
-                        "Update complete. DirectCut RS restarted successfully.",
-                        Progress::Fraction(1.0),
-                    );
-                }
                 Some(InstallState::Prepared) | None => {
                     // Cancellation and readiness errors must let the waiting parent
                     // observe process exit. Freshen records the readiness diagnostic.

@@ -107,3 +107,135 @@ fn ask(owner: Window, message: &str, _: usize) -> (bool, bool) {
         false,
     )
 }
+
+#[cfg(windows)]
+pub use about::{AboutDialog, show_about};
+
+#[cfg(windows)]
+mod about {
+    use rungui::{NativeHandle, Window};
+    use windows::{
+        Win32::{
+            Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                DialogBoxParamW, EndDialog, GWLP_USERDATA, GetWindowLongPtrW, IDCANCEL,
+                MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW, SetDlgItemTextW,
+                SetWindowLongPtrW, WM_CLOSE, WM_COMMAND, WM_INITDIALOG,
+            },
+        },
+        core::{PCWSTR, w},
+    };
+
+    const ABOUT_DIALOG: usize = 103;
+    const ABOUT_TEXT: i32 = 1001;
+    const CHECK_FOR_UPDATES: i32 = 1002;
+    const UPDATE_STATUS: i32 = 1003;
+
+    #[derive(Clone, Copy)]
+    pub struct AboutDialog(HWND);
+
+    impl AboutDialog {
+        pub fn set_status(self, text: &str) {
+            let text = wide(text);
+            unsafe {
+                let _ = SetDlgItemTextW(self.0, UPDATE_STATUS, PCWSTR(text.as_ptr()));
+            }
+        }
+
+        pub fn close(self) {
+            unsafe {
+                let _ = EndDialog(self.0, IDCANCEL.0 as isize);
+            }
+        }
+
+        pub fn show_update_result(self, text: &str, error: bool) {
+            let text = wide(text);
+            let icon = if error {
+                MB_ICONERROR
+            } else {
+                MB_ICONINFORMATION
+            };
+            unsafe {
+                MessageBoxW(
+                    self.0,
+                    PCWSTR(text.as_ptr()),
+                    w!("DirectCut RS updates"),
+                    MB_OK | icon,
+                );
+            }
+        }
+    }
+
+    struct State<'a> {
+        text: Vec<u16>,
+        initialized: &'a dyn Fn(AboutDialog),
+        check: &'a dyn Fn(),
+    }
+
+    pub fn show_about(
+        owner: Window,
+        text: &str,
+        initialized: impl Fn(AboutDialog),
+        check: impl Fn(),
+    ) -> bool {
+        let Some(NativeHandle::Win32(owner)) = owner.native_handle() else {
+            return false;
+        };
+        let state = State {
+            text: wide(text),
+            initialized: &initialized,
+            check: &check,
+        };
+        unsafe {
+            let Ok(module) = GetModuleHandleW(None) else {
+                return false;
+            };
+            DialogBoxParamW(
+                HINSTANCE(module.0),
+                PCWSTR(ABOUT_DIALOG as *const u16),
+                HWND(owner as isize),
+                Some(dialog_proc),
+                LPARAM(&state as *const State<'_> as isize),
+            ) != -1
+        }
+    }
+
+    unsafe extern "system" fn dialog_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
+        unsafe {
+            match message {
+                WM_INITDIALOG => {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, lparam.0);
+                    let state = &*(lparam.0 as *const State<'_>);
+                    let _ = SetDlgItemTextW(hwnd, ABOUT_TEXT, PCWSTR(state.text.as_ptr()));
+                    (state.initialized)(AboutDialog(hwnd));
+                    1
+                }
+                WM_COMMAND if wparam.0 as u16 as i32 == CHECK_FOR_UPDATES => {
+                    let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const State<'_>);
+                    AboutDialog(hwnd).set_status("Checking for updates...");
+                    (state.check)();
+                    1
+                }
+                WM_COMMAND if wparam.0 as u16 as i32 == IDCANCEL.0 => {
+                    AboutDialog(hwnd).close();
+                    1
+                }
+                WM_CLOSE => {
+                    AboutDialog(hwnd).close();
+                    1
+                }
+                _ => 0,
+            }
+        }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+}
