@@ -126,6 +126,23 @@ fn expanded_title(title: &str, sources: &[(usize, String)], frame: usize) -> Str
     title.replace(FILE_TOKEN, &file)
 }
 
+fn check_splice_format(destination: Info, incoming: Info) -> Result<()> {
+    if incoming.rate() != destination.rate() {
+        return Err(format!(
+            "Sample rates must match. The incoming audio is {} Hz and the timeline is {} Hz. DirectCut does not resample audio.",
+            incoming.rate(),
+            destination.rate()
+        )
+        .into());
+    }
+    if incoming != destination {
+        return Err(
+            "The incoming audio must match the timeline's format and channel count.".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Whether two average bitrates differ at whole-kbps precision. A steady
 /// 128 kbps file and a VBR stream averaging 128.03 are the same rate to a
 /// listener; 128 and 192 are not.
@@ -2115,9 +2132,10 @@ impl Editor {
                     } else {
                         match insertion.result {
                             Ok(timeline) => {
-                                if timeline.info != self.format {
+                                if let Err(error) = check_splice_format(self.format, timeline.info)
+                                {
                                     self.activity = format!(
-                                        "Could not insert {}. Insert requires the same format, sample rate, and channel count.",
+                                        "Could not insert {}. {error}",
                                         name(&insertion.path)
                                     );
                                     let window = self.window;
@@ -3884,11 +3902,7 @@ impl Editor {
                     .borrow()
                     .clone()
                     .ok_or("The DirectCut clipboard is empty.")?;
-                if clip.info != self.format {
-                    return Err(
-                        "Paste requires the same format, sample rate, and channel count.".into(),
-                    );
-                }
+                check_splice_format(self.format, clip.info)?;
                 let position = self.position();
                 let range = self.edit.selection().unwrap_or(position..position);
                 let replaced = range.start < range.end;
@@ -4078,6 +4092,18 @@ mod tests {
 
     fn source(frame: usize, name: &str) -> (usize, String) {
         (frame, name.to_string())
+    }
+
+    #[test]
+    fn combining_audio_rejects_different_sample_rates() {
+        let destination = Info::test(44_100, 2);
+        let incoming = Info::test(48_000, 2);
+        let error = super::check_splice_format(destination, incoming)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("48000 Hz"));
+        assert!(error.contains("44100 Hz"));
+        assert!(super::check_splice_format(destination, destination).is_ok());
     }
 
     /// The split naming rule: a free suggestion is used as is; a taken one
