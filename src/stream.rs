@@ -44,6 +44,7 @@ fn cue_title(title: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 pub fn write_cue(path: &Path, audio_name: &str, entries: &[(f64, String)]) -> io::Result<()> {
     write_cue_checked(path, audio_name, entries, true)
 }
@@ -54,6 +55,21 @@ pub fn write_cue_checked(
     entries: &[(f64, String)],
     replace: bool,
 ) -> io::Result<()> {
+    persist_cue(path, &cue_contents(audio_name, entries), replace, None)
+}
+
+pub fn write_editor_cue(
+    path: &Path,
+    audio_name: &str,
+    entries: &[(f64, String)],
+    expected: Option<&[u8]>,
+) -> io::Result<Vec<u8>> {
+    let contents = cue_contents(audio_name, entries);
+    persist_cue(path, &contents, expected.is_some(), expected)?;
+    Ok(contents)
+}
+
+fn cue_contents(audio_name: &str, entries: &[(f64, String)]) -> Vec<u8> {
     let mut text = format!(
         "FILE \"{}\" {}\n\n",
         audio_name.replace('"', "'"),
@@ -67,13 +83,29 @@ pub fn write_cue_checked(
             cue_time(*seconds)
         ));
     }
+    text.into_bytes()
+}
+
+fn persist_cue(
+    path: &Path,
+    contents: &[u8],
+    replace: bool,
+    expected: Option<&[u8]>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(text.as_bytes())?;
+    temp.write_all(contents)?;
     temp.as_file().sync_all()?;
+    if let Some(expected) = expected {
+        if fs::read(path)? != expected {
+            return Err(io::Error::other(
+                "The existing CUE changed and was left in place.",
+            ));
+        }
+    }
     if replace {
         temp.persist(path).map_err(|error| error.error)?;
     } else {
@@ -134,6 +166,8 @@ pub struct TrimResult {
     pub audio: PathBuf,
     pub cue: Option<PathBuf>,
     pub csv: Option<PathBuf>,
+    /// Sidecar CSV failure does not invalidate successfully exported MP3/CUE.
+    pub csv_warning: Option<String>,
     pub start: f64,
     pub end: f64,
     pub frames: usize,
@@ -183,10 +217,25 @@ pub fn trim_mp3(
     // written, not by the raw CUE times.
     let start = start_frame as f64 * frame_seconds;
     let end = end_frame as f64 * frame_seconds;
-    let frames = scan.frames[start_frame..end_frame].to_vec();
+    let frames = scan.frames[start_frame..end_frame]
+        .iter()
+        .map(|frame| std::sync::Arc::new(crate::codec::Frame::Mp3(std::sync::Arc::clone(frame))))
+        .collect();
     let output = unique_output(audio_path, "_trimmed", "mp3")?;
-    audio::export(&output, scan.format, frames)
-        .map_err(|error| format!("Could not write the trimmed audio: {error}"))?;
+    let audio_result = audio::export_no_replace(
+        &output,
+        crate::codec::Info::Mp3 {
+            format: scan.format,
+        },
+        frames,
+    )
+    .map_err(|error| format!("Could not write the trimmed audio: {error}"))?;
+    if audio_result == audio::NoReplace::Existed {
+        return Err(format!(
+            "The trim destination {} is already in use. Run the trim again to choose another name.",
+            output.display()
+        ));
+    }
 
     let mut trimmed: Vec<(f64, String)> = entries
         .iter()
@@ -214,23 +263,36 @@ pub fn trim_mp3(
         .to_string_lossy()
         .into_owned();
     let cue = output.with_extension("cue");
-    write_cue(&cue, &out_name, &trimmed)
-        .map_err(|error| format!("Could not write {}: {error}", cue.display()))?;
+    write_cue_checked(&cue, &out_name, &trimmed, false).map_err(|error| {
+        format!(
+            "The trimmed audio was saved to {}, but its CUE sheet could not be written to {}: {error}. The original archive was not changed.",
+            output.display(),
+            cue.display()
+        )
+    })?;
 
-    let csv = rewrite_trimmed_csv(
+    let csv_result = rewrite_trimmed_csv(
         &audio_path.with_file_name("titles.csv"),
         &output.with_extension("csv"),
         segment_number(audio_path),
         start,
         end,
-    )
-    .ok()
-    .flatten();
+    );
+    let (csv, csv_warning) = match csv_result {
+        Ok(csv) => (csv, None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "The optional titles CSV could not be written: {error}"
+            )),
+        ),
+    };
 
     Ok(TrimResult {
         audio: output,
         cue: Some(cue),
         csv,
+        csv_warning,
         start,
         end,
         frames: end_frame - start_frame,
@@ -324,13 +386,31 @@ fn rewrite_trimmed_csv(
             csv_field(&title)
         ));
     }
-    fs::write(output, text)?;
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(text.as_bytes())?;
+    file.persist_noclobber(output)
+        .map_err(|error| error.error)?;
     Ok(Some(output.to_path_buf()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn editor_cue_does_not_replace_changed_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.cue");
+        let entries = [(0.0, "Title".into())];
+        let expected = write_editor_cue(&path, "edit.mp3", &entries, None).unwrap();
+        fs::write(&path, b"externally replaced").unwrap();
+        assert!(write_editor_cue(&path, "edit.mp3", &entries, Some(&expected)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"externally replaced");
+    }
+
     #[test]
     fn cue_without_replace_preserves_existing_file() {
         let directory = tempfile::tempdir().unwrap();

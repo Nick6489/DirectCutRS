@@ -15,10 +15,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not $InputDirectory) {
-    $InputDirectory = Join-Path $PSScriptRoot '..\target\fixtures'
+    $target = (& cargo metadata --format-version 1 --no-deps --locked |
+        ConvertFrom-Json).target_directory
+    $InputDirectory = Join-Path $target 'fixtures'
 }
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $PSScriptRoot '..\target\corruptions'
+    $target = (& cargo metadata --format-version 1 --no-deps --locked |
+        ConvertFrom-Json).target_directory
+    $OutputDirectory = Join-Path $target 'corruptions'
 }
 $input = [IO.Path]::GetFullPath($InputDirectory)
 $out = [IO.Path]::GetFullPath($OutputDirectory)

@@ -14,6 +14,10 @@ pub fn root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn app_settings() -> PathBuf {
+    root().join("settings.toml")
+}
+
 /// Scratch space for update downloads and staging.
 pub fn update_work() -> PathBuf {
     root().join(".freshen").join("work")

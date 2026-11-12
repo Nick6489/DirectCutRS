@@ -1,0 +1,46 @@
+#include <windows.h>
+
+101 DIALOGEX 0, 0, 270, 101
+STYLE DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Replace the marked range?"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "", 1001, 10, 10, 250, 38
+    CONTROL "&Don't ask again", 1002, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 52, 150, 12
+    PUSHBUTTON "&Replace", IDOK, 139, 76, 57, 14
+    DEFPUSHBUTTON "Cancel", IDCANCEL, 203, 76, 57, 14
+END
+
+102 DIALOGEX 0, 0, 270, 79
+STYLE DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Split Audio at Cue Points"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "", 1001, 10, 10, 250, 37
+    PUSHBUTTON "&Continue", IDOK, 139, 54, 57, 14
+    DEFPUSHBUTTON "Cancel", IDCANCEL, 203, 54, 57, 14
+END
+
+1 VERSIONINFO
+FILEVERSION 1,2,0,0
+PRODUCTVERSION 1,2,0,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "DirectCut RS"
+            VALUE "FileVersion", "1.2.0"
+            VALUE "ProductName", "DirectCut RS"
+            VALUE "ProductVersion", "1.2.0"
+            VALUE "OriginalFilename", "directcut-rs.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

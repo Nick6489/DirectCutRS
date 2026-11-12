@@ -2,23 +2,30 @@
 
 mod announce;
 mod audio;
+mod codec;
+mod dialogs;
+mod editkeys;
 mod editor;
+mod focus;
+mod id3;
 mod mp3;
 mod paths;
 mod report;
+mod settings;
 mod stream;
 mod stream_window;
+mod timeline;
 #[cfg(windows)]
 mod updates;
 
 use std::{
     cell::{Cell, RefCell},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     rc::Rc,
 };
 
-use mp3::Frames;
+use codec::Clipboard;
 use rungui::*;
 
 fn main() -> ExitCode {
@@ -32,12 +39,12 @@ fn main() -> ExitCode {
     }
 
     let app = App::new("DirectCut RS").expect("Could not initialize DirectCut RS");
-    let session = Session::default();
+    let session = Session::new(&paths::app_settings());
     let start = Window::new("DirectCut RS");
     let layout = VBox::new(start);
     layout.set_padding(16);
     layout.set_spacing(12);
-    let open = Button::new(layout, "&Open MP3...");
+    let open = Button::new(layout, "&Open Audio...");
     let about = Button::new(layout, "&About...");
 
     #[cfg(windows)]
@@ -57,7 +64,7 @@ fn main() -> ExitCode {
     #[cfg(not(windows))]
     about.on_click(move || {
         message_box(Some(start), MessageKind::Info, Buttons::Ok, "About DirectCut RS",
-            "DirectCut RS 1.1\nBy Nick Giannak III\nContributions by Derek Lane.\nMade exclusively with artificial intelligence.\nCopyright © 2026 Nick Giannak III\nMIT License");
+            "DirectCut RS 1.2\nBy Nick Giannak III\nContributions by Derek Lane.\nMade exclusively with artificial intelligence.\nCopyright © 2026 Nick Giannak III\nMIT License");
     });
     open.on_click({
         let session = session.clone();
@@ -73,9 +80,11 @@ fn main() -> ExitCode {
     });
     let bar = MenuBar::new(start);
     let file_menu = Menu::new(bar, "&File");
-    let menu_open = MenuItem::new(file_menu, "&Open MP3...");
+    let menu_open = MenuItem::new(file_menu, "&Open Audio...");
     menu_open.set_accel("Ctrl+O");
     let menu_trim = MenuItem::new(file_menu, "&Trim Archive...");
+    let menu_paste = MenuItem::new(file_menu, "Open Audio Files from &Clipboard");
+    menu_paste.set_accel("Ctrl+V");
     MenuSeparator::new(file_menu);
     let menu_exit = MenuItem::new(file_menu, "E&xit");
     menu_open.on_click({
@@ -93,6 +102,10 @@ fn main() -> ExitCode {
     menu_trim.on_click({
         let session = session.clone();
         move || stream_window::trim_window(start, None, session.clone())
+    });
+    menu_paste.on_click({
+        let session = session.clone();
+        move || editor::paste_files_from_clipboard(start, &session)
     });
     menu_exit.on_click(move || start.close());
 
@@ -193,11 +206,23 @@ fn print_analysis_usage() {
 
 #[derive(Clone, Default)]
 struct Session {
-    clipboard: Rc<RefCell<Option<(mp3::Format, Frames)>>>,
+    clipboard: Rc<RefCell<Option<Clipboard>>>,
     documents: Rc<Cell<usize>>,
+    settings: Rc<RefCell<settings::AppSettings>>,
 }
 
 impl Session {
+    /// Load the app-wide settings so new windows open where the last session
+    /// left them: the chosen playback device, the scrub zoom, and the speed.
+    fn new(settings_path: &Path) -> Self {
+        let settings = settings::load(settings_path);
+        Self {
+            clipboard: Rc::new(RefCell::new(None)),
+            documents: Rc::new(Cell::new(0)),
+            settings: Rc::new(RefCell::new(settings)),
+        }
+    }
+
     fn opening_document(&self) -> OpenDocument {
         self.documents.set(self.documents.get() + 1);
         OpenDocument(self.documents.clone())

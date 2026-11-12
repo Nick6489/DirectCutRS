@@ -312,7 +312,7 @@ impl Checks {
         let status = Label::new(column, "");
         let row = HBox::new(column);
         row.set_spacing(8);
-        let check = Button::new(row, "&Check for updates");
+        let check = Button::new(row, "Check for &updates");
         let close = Button::new(row, "&Close");
         check.on_click({
             let checks = self.clone();
@@ -502,7 +502,7 @@ impl Dialog {
         }
         if self.documents.get() > 0 {
             self.status.show(
-                "Close all MP3 editor windows before installing. Save any edits first.",
+                "Close all audio editor windows before installing. Save any edits first.",
                 Progress::Idle,
             );
             return;

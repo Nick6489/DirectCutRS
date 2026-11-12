@@ -43,6 +43,40 @@ pub fn announce(window: Window, text: &str) {
     }
 }
 
+/// Temporary diagnostics for the announcement chain, active only while
+/// `DIRECTCUT_ANNOUNCE_DEBUG` is set to a non-empty value. Lines append to
+/// `announce-debug.log` beside the running executable, so a missing
+/// announcement can be traced: whether a client was listening, whether this
+/// window had a provider attached, and what `UiaRaiseNotificationEvent`
+/// returned. Remove once the speech gap is root-caused.
+pub(crate) fn debug_log(line: &str) -> bool {
+    let enabled =
+        std::env::var_os("DIRECTCUT_ANNOUNCE_DEBUG").is_some_and(|value| !value.is_empty());
+    if !enabled {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(directory) = exe.parent() else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("announce-debug.log"))
+    else {
+        return false;
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    use std::io::Write;
+    let _ = writeln!(file, "{millis} {line}");
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::announce;
@@ -180,6 +214,7 @@ mod windows {
                 std::mem::transmute::<WindowProc, isize>(Some(wndproc)),
             );
         }
+        super::debug_log(&format!("attach hwnd={key}"));
     }
 
     unsafe extern "system" fn wndproc(
@@ -218,10 +253,13 @@ mod windows {
     }
 
     pub unsafe fn announce(window: Window, text: &str) {
-        if !unsafe { UiaClientsAreListening() }.as_bool() {
+        let listening = unsafe { UiaClientsAreListening() }.as_bool();
+        super::debug_log(&format!("announce text={text:?} listening={listening}"));
+        if !listening {
             return;
         }
         let Some(NativeHandle::Win32(hwnd)) = window.native_handle() else {
+            super::debug_log("announce: the window has no Win32 handle");
             return;
         };
         let key = hwnd as isize;
@@ -231,21 +269,24 @@ mod windows {
             .get(&key)
             .map(|a| a.provider.clone());
         let Some(provider) = provider else {
+            super::debug_log(&format!("announce: no provider is attached for hwnd={key}"));
             return;
         };
         let Some(raise) = raise_notification() else {
+            super::debug_log("announce: UiaRaiseNotificationEvent is unavailable");
             return;
         };
         let display = BSTR::from(text);
         let activity = BSTR::from("DirectCut RS");
-        unsafe {
+        let result = unsafe {
             raise(
                 provider.as_raw(),
                 NOTIFICATION_ACTION_COMPLETED,
                 PROCESSING_IMPORTANT_MOST_RECENT,
                 display.as_ptr() as *mut u16,
                 activity.as_ptr() as *mut u16,
-            );
-        }
+            )
+        };
+        super::debug_log(&format!("announce: raised hr=0x{result:08X}"));
     }
 }

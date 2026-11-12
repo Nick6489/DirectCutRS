@@ -27,6 +27,36 @@ fn show_and_focus(window: Window, target: Widget) {
     }
 }
 
+fn park_focus_before_disable(disabled: Widget, fallback: Widget) {
+    if hwnd_of(disabled).is_some_and(|hwnd| focus_hwnd() == Some(hwnd)) {
+        fallback.focus();
+    }
+    disabled.set_enabled(false);
+}
+
+/// The HWND of a widget, for comparing against the keyboard focus owner.
+fn hwnd_of(widget: Widget) -> Option<isize> {
+    match widget.native_handle() {
+        Some(NativeHandle::Win32(hwnd)) => Some(hwnd as isize),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn focus_hwnd() -> Option<isize> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetFocus() -> isize;
+    }
+    let focus = unsafe { GetFocus() };
+    (focus != 0).then_some(focus)
+}
+
+#[cfg(not(windows))]
+fn focus_hwnd() -> Option<isize> {
+    None
+}
+
 pub fn trim_window(_parent: Window, initial: Option<PathBuf>, session: Session) {
     let window = Window::new("Trim Stream Archive");
     let column = VBox::new(window);
@@ -174,8 +204,10 @@ impl TrimUi {
     fn load(&mut self, path: &Path) {
         self.file.set_text(&path.to_string_lossy());
         self.result = None;
-        self.open.set_enabled(false);
-        self.trim.set_enabled(false);
+        park_focus_before_disable(*self.open, *self.file);
+
+        park_focus_before_disable(*self.trim, *self.file);
+
         self.entries.clear();
         self.first.set_items::<&str>(&[]);
         self.last.set_items::<&str>(&[]);
@@ -266,7 +298,8 @@ impl TrimUi {
             return;
         }
         self.receiver = Some(receiver);
-        self.trim.set_enabled(false);
+        park_focus_before_disable(*self.trim, *self.file);
+
         self.info.set_text("Trimming and validating the new MP3...");
     }
 
@@ -310,6 +343,10 @@ impl TrimUi {
                         " Titles: {}.",
                         csv.file_name().unwrap_or(csv.as_os_str()).to_string_lossy()
                     ));
+                }
+                if let Some(warning) = &result.csv_warning {
+                    message.push_str(" Warning: ");
+                    message.push_str(warning);
                 }
                 self.info.set_text(&message);
                 self.open.set_enabled(true);

@@ -62,8 +62,16 @@ pub struct Frame {
     #[allow(dead_code)]
     source: usize,
     /// Length of this frame in the file it was imported from.
-    #[allow(dead_code)]
     length: usize,
+}
+
+impl Frame {
+    /// The frame's full length in bytes in the file it was imported from:
+    /// header, side information, and data. This is the transport length the
+    /// timeline's average bitrate is measured over.
+    pub fn length(&self) -> usize {
+        self.length
+    }
 }
 
 pub type Frames = Vec<Arc<Frame>>;
@@ -308,13 +316,12 @@ fn audio_region(bytes: &[u8]) -> AudioRegion<'_> {
         let total = 10usize.saturating_add(size).saturating_add(footer);
         let version = format!("ID3v2.{}", header[3]);
         if size_valid && total <= rest.len() {
-            log.push(
-                EventKind::Metadata,
-                start,
-                start + total,
-                0,
-                format!("{version} tag at the start of the file was not copied"),
-            );
+            let mut detail = format!("{version} tag at the start of the file was not copied");
+            if let Some(inventory) = crate::id3::scan_v2(&rest[..total]) {
+                detail.push_str("; ");
+                detail.push_str(&inventory.summary());
+            }
+            log.push(EventKind::Metadata, start, start + total, 0, detail);
             start += total;
             continue;
         }
@@ -335,13 +342,12 @@ fn audio_region(bytes: &[u8]) -> AudioRegion<'_> {
 
     let mut end = bytes.len();
     if end >= 128 && bytes[end - 128..].starts_with(b"TAG") {
-        log.push(
-            EventKind::Metadata,
-            end - 128,
-            end,
-            0,
-            "ID3v1 tag at the end of the file was not copied",
-        );
+        let mut detail = "ID3v1 tag at the end of the file was not copied".to_string();
+        if let Some(inventory) = crate::id3::scan_v1(&bytes[end - 128..]) {
+            detail.push_str("; ");
+            detail.push_str(&inventory.summary());
+        }
+        log.push(EventKind::Metadata, end - 128, end, 0, detail);
         end -= 128;
     }
     if end >= 32 {
@@ -400,6 +406,19 @@ fn complete_header(bytes: &[u8]) -> Option<FrameHeader> {
 /// A 4-byte MPEG Layer III header without requiring the frame body to be present.
 fn header_at(bytes: &[u8]) -> Option<Format> {
     header_format(bytes.get(..4)?.try_into().ok()?).ok()
+}
+
+/// The MPEG Layer III header at the start of `bytes`, with the frame's total
+/// length in bytes. The body need not be present. None when `bytes` does not
+/// start with a usable Layer III header.
+pub fn frame_at(bytes: &[u8]) -> Option<(Format, usize)> {
+    let h: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    if h[0] != 0xff || h[1] & 0xe0 != 0xe0 {
+        return None;
+    }
+    let format = header_format(h).ok()?;
+    let len = format.frame_len((h[2] >> 4) as usize, h[2] & 2 != 0);
+    (len >= 4 + format.side_len()).then_some((format, len))
 }
 
 fn starts_stream(bytes: &[u8]) -> bool {
@@ -468,7 +487,12 @@ pub struct Scan {
 
 impl Scan {
     pub fn duration(&self) -> std::time::Duration {
-        crate::audio::duration(self.format, self.frame_count)
+        crate::audio::duration(
+            crate::codec::Info::Mp3 {
+                format: self.format,
+            },
+            self.frame_count,
+        )
     }
 
     /// True when imported audio has a gap, a format change, or a damaged frame.
@@ -1200,6 +1224,9 @@ mod tests {
         assert_eq!(scan.frames[0].source, 0);
         assert_eq!(scan.frames[1].source, len);
         assert_eq!(scan.frames[1].length, len);
+        // The public accessor reports the same transport length the average
+        // bitrate is measured over.
+        assert_eq!(scan.frames[1].length(), len);
         assert_eq!(scan.retained_bytes, 3 * len);
     }
 
@@ -1360,7 +1387,12 @@ mod tests {
                 .cloned()
                 .collect();
             let output = directory.join(format!("out-{left}.mp3"));
-            crate::audio::export(&output, format, clip.clone()).unwrap();
+            let frames: crate::codec::Frames = clip
+                .clone()
+                .into_iter()
+                .map(|frame| std::sync::Arc::new(crate::codec::Frame::Mp3(frame)))
+                .collect();
+            crate::audio::export(&output, crate::codec::Info::Mp3 { format }, frames).unwrap();
             let (actual_format, actual, recovery) = parse(&std::fs::read(output).unwrap()).unwrap();
             assert_eq!(actual_format, format);
             assert_eq!(recovery, Recovery::default());

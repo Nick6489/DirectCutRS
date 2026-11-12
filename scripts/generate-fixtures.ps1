@@ -1,4 +1,4 @@
-# Generate deterministic, freely creatable MP3 fixtures for DirectCut RS tests.
+# Generate deterministic, freely creatable audio fixtures for DirectCut RS tests.
 #
 # Requires ffmpeg and lame on PATH. The output contains synthesized tones only;
 # no copyrighted recordings and no personal archives are used.
@@ -15,7 +15,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $PSScriptRoot '..\target\fixtures'
+    # The project's one build tree, so fixtures never create another target
+    # directory beside the source.
+    $target = (& cargo metadata --format-version 1 --no-deps --locked |
+        ConvertFrom-Json).target_directory
+    $OutputDirectory = Join-Path $target 'fixtures'
 }
 $out = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -28,6 +32,8 @@ foreach ($tool in 'ffmpeg', 'lame') {
 
 function Invoke-Tool {
     param([string]$Tool, [string[]]$Arguments)
+    $native = Get-Command "$Tool.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($native) { $Tool = $native.Source }
     & $Tool @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "$Tool failed with exit code $LASTEXITCODE"
@@ -79,6 +85,12 @@ Invoke-Tool ffmpeg @(
 Invoke-Tool lame @('--quiet', '-b', '128', '-p', $wav, (Join-Path $out 'crc.mp3'))
 Remove-Item -LiteralPath $wav -Force
 
+# MPEG-1 Layer II, 44.1 kHz, stereo, for the self-contained frame walker.
+New-StereoTone (Join-Path $out 'cbr.mp2') @('-c:a', 'mp2', '-b:a', '192k')
+
+# ADTS AAC-LC, 44.1 kHz, stereo, for the self-contained frame walker.
+New-StereoTone (Join-Path $out 'cbr.aac') @('-c:a', 'aac', '-b:a', '128k', '-f', 'adts')
+
 # ID3v2.3 tag with embedded cover art, for metadata inventory tests.
 $cover = Join-Path $out 'cover.png'
 Invoke-Tool ffmpeg @(
@@ -98,5 +110,5 @@ Invoke-Tool ffmpeg @(
 )
 Remove-Item -LiteralPath $cover -Force
 
-Get-ChildItem -LiteralPath $out -Filter '*.mp3' | Sort-Object Name |
+Get-ChildItem -LiteralPath $out | Sort-Object Name |
     Select-Object Name, Length

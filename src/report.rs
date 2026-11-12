@@ -8,6 +8,7 @@ use std::{fs, path::Path, time::Duration};
 
 use sha2::{Digest, Sha256};
 
+use crate::codec;
 use crate::mp3::{self, EventKind, Result, Scan};
 
 /// Suggested name for a report sidecar.
@@ -138,8 +139,10 @@ pub fn build(scan: &Scan, label: &str, hash: Option<&str>) -> String {
     );
     let _ = writeln!(text, "Status: {}", classification(scan));
     text.push_str(
-        "Validation: structural parsing only. No decoder or encoder ran during this analysis.\r\n\r\n",
+        "Validation: structural parsing only. No decoder or encoder ran during this analysis.\r\n",
     );
+    let _ = writeln!(text, "{}", codec::MP3.summary());
+    text.push_str("\r\n");
 
     if scan.events.is_empty() {
         text.push_str("Events: none.\r\n");
@@ -186,27 +189,33 @@ pub fn build(scan: &Scan, label: &str, hash: Option<&str>) -> String {
 
 /// Short text for the editor's timeline status (F6). Returns `None` for a clean
 /// import so healthy files stay quiet.
-pub fn summary(scan: &Scan) -> Option<String> {
-    if !scan.has_gaps() {
+pub fn summary(timeline: &codec::Timeline) -> Option<String> {
+    if !timeline.has_gaps() {
         return None;
     }
+    let problems = timeline
+        .events
+        .iter()
+        .filter(|event| event.kind.is_problem())
+        .count();
     let mut text = format!(
-        "Import recovery: {} skipped byte(s), {} frame(s) skipped for missing reservoir data, {} event(s).",
-        scan.recovery.skipped_bytes,
-        scan.recovery.skipped_frames,
-        scan.events
-            .iter()
-            .filter(|event| event.kind.is_problem())
-            .count()
+        "Import recovery: {} skipped byte(s), {} frame(s) skipped, {} event(s).",
+        timeline.recovery.skipped_bytes,
+        timeline.recovery.skipped_frames,
+        problems + timeline.suppressed_events,
     );
-    for (shown, event) in scan
+    for (shown, event) in timeline
         .events
         .iter()
         .filter(|event| event.kind.is_problem())
         .enumerate()
     {
         if shown == 3 {
-            text.push_str("\r\nMore events are listed by Analyze MP3.");
+            if timeline.info.kind() == codec::Kind::Mp3 {
+                text.push_str("\r\nMore events are listed by Analyze Source MP3.");
+            } else {
+                text.push_str("\r\nMore events were omitted from this summary.");
+            }
             break;
         }
         text.push_str("\r\n- ");
