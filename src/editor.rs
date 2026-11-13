@@ -754,7 +754,7 @@ type SelectionMessage = (PathBuf, ExportResult);
 
 struct Editor {
     window: Window,
-    status: TextArea,
+    status: Label,
     activity: String,
     recovery: Option<String>,
     path: PathBuf,
@@ -1416,24 +1416,17 @@ fn create(path: PathBuf, opened: Opened, session: Session, open_document: OpenDo
         cue_error,
     } = opened;
     let window = Window::new("DirectCut RS");
-    announce::attach(window);
     let column = VBox::new(window);
     column.set_padding(12);
     column.set_spacing(8);
-    Label::new(column, "Timeline status (F6)");
+    let read_status = Button::new(column, "Timeline status (F6)");
     let strip = Label::new(column, "Timeline");
     strip.set_min_size(0, 24);
     let timeline_strip = timeline_control::Timeline::attach(&strip);
-    let status = TextArea::new(column);
-    status.set_a11y_name("Timeline status");
-    status.set_read_only(true);
+    // Static text keeps the status visible without making it a focus target.
+    // F6 opens the full readable status.
+    let status = Label::new(column, "");
     status.set_min_size(480, 125);
-    // The status display is not a tab stop: keyboard focus cannot park in it,
-    // so its per-scrub text changes are not announced character by character.
-    // F6 remains the full readable status.
-    editkeys::make_display_only(&status);
-    // The read-only status view must not swallow Tab either.
-    editkeys::allow_tab_to_escape(&status);
     let bar = MenuBar::new(window);
     let recovery = report::summary(&timeline);
     let format = timeline.info;
@@ -1758,6 +1751,15 @@ fn create(path: PathBuf, opened: Opened, session: Session, open_document: OpenDo
     }
     MenuSeparator::new(transport);
     add(transport, "Read Timeline St&atus", "F6", Status);
+    read_status.on_click({
+        let editor = editor.clone();
+        move || {
+            let result = editor.borrow_mut().run(Status);
+            if let Err(error) = result {
+                show_error(window, &error.to_string());
+            }
+        }
+    });
     let help_menu = Menu::new(bar, "&Help");
     add(help_menu, "&Keyboard Shortcuts", "F1", Help);
     {
@@ -1778,7 +1780,8 @@ fn create(path: PathBuf, opened: Opened, session: Session, open_document: OpenDo
     editor.borrow_mut().refresh();
     window.set_size(570, 230);
     window.show();
-    status.focus();
+    // A native child gives screen readers a focus target with no text caret.
+    read_status.focus();
 }
 
 fn can_close(editor: &RefCell<Editor>) -> bool {
@@ -1895,7 +1898,7 @@ impl Editor {
     }
 
     fn speak(&self, text: &str) {
-        announce::announce(self.window, text);
+        announce::announce(text);
     }
 
     fn refresh(&mut self) {
@@ -1927,7 +1930,7 @@ impl Editor {
             if !during_playback {
                 self.freeze_status = false;
             }
-        } else if !during_playback || !crate::focus::has_focus(&self.status) {
+        } else {
             let status = self.status_text();
             if self.status.text() != status {
                 self.status.set_text(&status);

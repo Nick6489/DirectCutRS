@@ -1,292 +1,39 @@
-//! Screen-reader announcements through Windows UI Automation notifications.
-//!
-//! This is deliberately not a speech synthesizer. If no accessibility client is
-//! listening, the call does nothing. There is no SAPI, OneCore, or other TTS
-//! fallback, so a machine without a screen reader stays silent.
-//!
-//! `UiaRaiseNotificationEvent` arrived in Windows 10 version 1709 and is the
-//! only UIA entry point resolved at runtime here, so older systems still start
-//! and simply run without announcements.
-//!
-//! Notifications must be raised on a real provider node. Microsoft's docs for
-//! `UiaHostProviderFromHwnd` state that its host provider "cannot be used to
-//! raise events", so [`attach`] exposes a minimal pass-through
-//! `IRawElementProviderSimple` for the window through `WM_GETOBJECT`, and
-//! announcements are raised on that provider.
+//! Direct screen-reader speech through Prism.
 
-use rungui::Window;
+#[cfg(windows)]
+use prismer::{BackendId, Features, Prism};
 
-/// Expose the announcement provider on `window`. Call once when the window is
-/// created, before an accessibility client queries it.
-pub fn attach(window: Window) {
-    #[cfg(windows)]
-    unsafe {
-        windows::attach(window)
-    };
-    #[cfg(not(windows))]
-    {
-        let _ = window;
-    }
+#[cfg(windows)]
+thread_local! {
+    static PRISM: Option<Prism> = Prism::new().ok();
 }
 
-pub fn announce(window: Window, text: &str) {
+pub fn announce(text: &str) {
     if text.is_empty() {
         return;
     }
     #[cfg(windows)]
-    unsafe {
-        windows::announce(window, text)
-    };
-    #[cfg(not(windows))]
-    {
-        let _ = window;
-    }
-}
-
-/// Temporary diagnostics for the announcement chain, active only while
-/// `DIRECTCUT_ANNOUNCE_DEBUG` is set to a non-empty value. Lines append to
-/// `announce-debug.log` beside the running executable, so a missing
-/// announcement can be traced: whether a client was listening, whether this
-/// window had a provider attached, and what `UiaRaiseNotificationEvent`
-/// returned. Remove once the speech gap is root-caused.
-pub(crate) fn debug_log(line: &str) -> bool {
-    let enabled =
-        std::env::var_os("DIRECTCUT_ANNOUNCE_DEBUG").is_some_and(|value| !value.is_empty());
-    if !enabled {
-        return false;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Some(directory) = exe.parent() else {
-        return false;
-    };
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("announce-debug.log"))
-    else {
-        return false;
-    };
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_millis())
-        .unwrap_or(0);
-    use std::io::Write;
-    let _ = writeln!(file, "{millis} {line}");
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::announce;
-    use rungui::{WidgetId, Window};
-
-    #[test]
-    fn announcing_to_a_dead_window_does_nothing() {
-        announce(Window::from_id(WidgetId::DEAD), "This must stay silent.");
-    }
-}
-
-#[cfg(windows)]
-mod windows {
-    use std::collections::HashMap;
-    use std::ffi::c_void;
-    use std::sync::{Mutex, OnceLock};
-
-    use rungui::{NativeHandle, Window};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Accessibility::{
-        IRawElementProviderSimple, IRawElementProviderSimple_Impl, ProviderOptions,
-        ProviderOptions_ServerSideProvider, UIA_PATTERN_ID, UIA_PROPERTY_ID,
-        UiaClientsAreListening, UiaHostProviderFromHwnd, UiaReturnRawElementProvider,
-        UiaRootObjectId,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, DefWindowProcW, GWLP_WNDPROC, GetWindowLongPtrW, SetWindowLongPtrW,
-        WM_DESTROY, WM_GETOBJECT,
-    };
-    use windows::core::{BSTR, IUnknown, Interface, Result as ComResult, VARIANT, implement, w};
-
-    const NOTIFICATION_ACTION_COMPLETED: i32 = 2;
-    const PROCESSING_IMPORTANT_MOST_RECENT: i32 = 1;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn LoadLibraryW(name: *const u16) -> *mut c_void;
-        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-    }
-
-    type RaiseNotification =
-        unsafe extern "system" fn(*mut c_void, i32, i32, *const u16, *const u16) -> i32;
-
-    /// `UiaRaiseNotificationEvent` is the only announcement entry point that
-    /// requires Windows 10 version 1709, so it alone is resolved at runtime.
-    static RAISE: OnceLock<Option<RaiseNotification>> = OnceLock::new();
-
-    fn raise_notification() -> Option<RaiseNotification> {
-        *RAISE.get_or_init(|| unsafe {
-            let name = w!("uiautomationcore.dll");
-            let module = LoadLibraryW(name.as_ptr());
-            if module.is_null() {
-                return None;
+    PRISM.with(|prism| {
+        let Some(prism) = prism else { return };
+        // Prefer direct screen-reader backends. Keep the app quiet when no
+        // reader is running, and avoid the UIA notification path.
+        let mut readers = prism.backend_ids();
+        readers.sort_by_key(|&id| std::cmp::Reverse(prism.backend_priority(id)));
+        for id in readers {
+            if id == BackendId::UIA {
+                continue;
             }
-            let address = GetProcAddress(module, c"UiaRaiseNotificationEvent".as_ptr().cast());
-            if address.is_null() {
-                return None;
-            }
-            Some(std::mem::transmute_copy(&address))
-        })
-    }
-
-    /// A minimal pass-through provider. It overrides no properties and no
-    /// patterns, so the tree that screen readers see is still the host window
-    /// element's tree; it exists so notifications have a real provider node to
-    /// be raised on.
-    #[implement(IRawElementProviderSimple)]
-    struct Provider {
-        hwnd: isize,
-    }
-
-    impl IRawElementProviderSimple_Impl for Provider {
-        fn ProviderOptions(&self) -> ComResult<ProviderOptions> {
-            Ok(ProviderOptions_ServerSideProvider)
-        }
-
-        fn GetPatternProvider(&self, _patternid: UIA_PATTERN_ID) -> ComResult<IUnknown> {
-            // UIA queries the returned object for the requested pattern; the
-            // host window element implements none, so this is the COM-safe way
-            // to report "no pattern".
-            self.HostRawElementProvider()?.cast::<IUnknown>()
-        }
-
-        fn GetPropertyValue(&self, _propertyid: UIA_PROPERTY_ID) -> ComResult<VARIANT> {
-            // VT_EMPTY defers every property to the host window element.
-            Ok(VARIANT::default())
-        }
-
-        fn HostRawElementProvider(&self) -> ComResult<IRawElementProviderSimple> {
-            unsafe { UiaHostProviderFromHwnd(HWND(self.hwnd)) }
-        }
-    }
-
-    struct Attached {
-        provider: IRawElementProviderSimple,
-        previous: WindowProc,
-    }
-
-    // The provider interface reference is only ever touched on the window's
-    // own thread (attach, WM_GETOBJECT, and announce all run there); the Mutex
-    // serializes that access.
-    unsafe impl Send for Attached {}
-
-    type WindowProc = Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>;
-
-    static ATTACHED: OnceLock<Mutex<HashMap<isize, Attached>>> = OnceLock::new();
-
-    fn attached() -> &'static Mutex<HashMap<isize, Attached>> {
-        ATTACHED.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    pub unsafe fn attach(window: Window) {
-        let Some(NativeHandle::Win32(hwnd)) = window.native_handle() else {
-            return;
-        };
-        let key = hwnd as isize;
-        let mut attached = attached().lock().unwrap();
-        if attached.contains_key(&key) {
-            return;
-        }
-        let h = HWND(hwnd as isize);
-        let previous = unsafe { GetWindowLongPtrW(h, GWLP_WNDPROC) };
-        attached.insert(
-            key,
-            Attached {
-                provider: Provider { hwnd: key }.into(),
-                previous: unsafe { std::mem::transmute::<isize, WindowProc>(previous) },
-            },
-        );
-        drop(attached);
-        unsafe {
-            SetWindowLongPtrW(
-                h,
-                GWLP_WNDPROC,
-                std::mem::transmute::<WindowProc, isize>(Some(wndproc)),
-            );
-        }
-        super::debug_log(&format!("attach hwnd={key}"));
-    }
-
-    unsafe extern "system" fn wndproc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        let key = hwnd.0;
-        if msg == WM_GETOBJECT
-            && lparam.0 as i32 == UiaRootObjectId
-            && let Some(provider) = attached()
-                .lock()
-                .unwrap()
-                .get(&key)
-                .map(|a| a.provider.clone())
-        {
-            unsafe {
-                return UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider);
+            let Ok(backend) = prism.create(id) else {
+                continue;
+            };
+            if backend
+                .features()
+                .contains(Features::IS_SCREEN_READER | Features::SPEAK)
+                && backend.initialize().is_ok()
+                && backend.speak(text, false).is_ok()
+            {
+                break;
             }
         }
-        let previous = attached().lock().unwrap().get(&key).map(|a| a.previous);
-        if msg == WM_DESTROY
-            && let Some(entry) = attached().lock().unwrap().remove(&key)
-        {
-            // Tell UIA the window is gone, releasing its raised-event map.
-            unsafe {
-                let _ = UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None);
-            }
-            let _ = entry;
-        }
-        match previous {
-            Some(previous) => unsafe { CallWindowProcW(previous, hwnd, msg, wparam, lparam) },
-            None => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-        }
-    }
-
-    pub unsafe fn announce(window: Window, text: &str) {
-        let listening = unsafe { UiaClientsAreListening() }.as_bool();
-        super::debug_log(&format!("announce text={text:?} listening={listening}"));
-        if !listening {
-            return;
-        }
-        let Some(NativeHandle::Win32(hwnd)) = window.native_handle() else {
-            super::debug_log("announce: the window has no Win32 handle");
-            return;
-        };
-        let key = hwnd as isize;
-        let provider = attached()
-            .lock()
-            .unwrap()
-            .get(&key)
-            .map(|a| a.provider.clone());
-        let Some(provider) = provider else {
-            super::debug_log(&format!("announce: no provider is attached for hwnd={key}"));
-            return;
-        };
-        let Some(raise) = raise_notification() else {
-            super::debug_log("announce: UiaRaiseNotificationEvent is unavailable");
-            return;
-        };
-        let display = BSTR::from(text);
-        let activity = BSTR::from("DirectCut RS");
-        let result = unsafe {
-            raise(
-                provider.as_raw(),
-                NOTIFICATION_ACTION_COMPLETED,
-                PROCESSING_IMPORTANT_MOST_RECENT,
-                display.as_ptr() as *mut u16,
-                activity.as_ptr() as *mut u16,
-            )
-        };
-        super::debug_log(&format!("announce: raised hr=0x{result:08X}"));
-    }
+    });
 }

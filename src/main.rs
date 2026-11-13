@@ -45,12 +45,14 @@ fn main() -> ExitCode {
     layout.set_padding(16);
     layout.set_spacing(12);
     #[cfg(windows)]
-    let update_status = updates::restarted_for_update().then(|| {
-        announce::attach(start);
-        Label::new(layout, "")
-    });
+    let update_status = updates::restarted_for_update().then(|| Label::new(layout, ""));
     let open = Button::new(layout, "&Open Audio...");
     let about = Button::new(layout, "&About...");
+    #[cfg(windows)]
+    {
+        editkeys::activate_on_enter(&open);
+        editkeys::activate_on_enter(&about);
+    }
 
     #[cfg(windows)]
     let checks = {

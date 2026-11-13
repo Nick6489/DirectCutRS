@@ -19,17 +19,15 @@ tempfile = "3.27.0"
 [target.'cfg(windows)'.dependencies]
 base64 = "0.22"
 freshen = { git = "https://github.com/Nick6489/freshen.git", rev = "778a649e17c7c5d71e01ea45e30ca805a14008f5" }
+prismer = { version = "=0.1.6", features = ["static"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 url = { version = "2", optional = true }
 windows = { version = "0.54", features = [
-  "implement",
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
-  "Win32_System_Com",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
   "Win32_UI_Shell",
-  "Win32_UI_Accessibility",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

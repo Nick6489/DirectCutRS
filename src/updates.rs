@@ -114,7 +114,7 @@ pub fn confirm_startup(window: Window, status: Label) {
             Err(error) => format!("Could not confirm the update. {}", update_error(&error)),
         };
         status.set_text(&message);
-        crate::announce::announce(window, &message);
+        crate::announce::announce(&message);
     };
     if let Err(error) = thread::Builder::new()
         .name("DirectCut RS update confirmation".into())

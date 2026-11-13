@@ -203,7 +203,7 @@ In an editor window, press **F1** or choose **Help > Keyboard Shortcuts** to rea
 
 ## Accessibility
 
-DirectCut announces title changes, jumps, marker positions, selection lengths, edits, pasted audio, and completed saves through Windows UI Automation notifications. It does not need a separate NVDA or JAWS add-on, and it does not speak through SAPI or another fallback voice. The **F6** timeline status and the keyboard-accessible reports remain available whether or not a screen reader is running.
+DirectCut announces title changes, jumps, marker positions, selection lengths, edits, pasted audio, and completed saves through Prism’s direct screen-reader backends. It works with supported screen readers without a separate add-on and stays quiet when no supported reader is running. The **F6** timeline status and the keyboard-accessible reports remain available whether or not a screen reader is running.
 
 When dialogs close, DirectCut attempts to restore keyboard focus to the control you were using beforehand. This matters during keyboard scrubbing and editing: you should not have to find your way back from an unrelated field after every prompt. The drawn timeline never takes focus.
 
@@ -217,7 +217,7 @@ The program checks GitHub for signed releases when it starts. To check manually,
 
 ## For developers
 
-DirectCut RS is written in Rust, with RunGUI native Windows controls and WASAPI playback. Build it using the Rust MSVC toolchain and Visual Studio C++ Build Tools:
+DirectCut RS is written in Rust, with RunGUI native Windows controls and WASAPI playback. Build it with the Rust MSVC toolchain, Visual Studio C++ Build Tools with C++23 support, and CMake 3.24 or newer. Cargo builds and statically links the bundled Prism library:
 
 ```powershell
 cargo build --release --locked

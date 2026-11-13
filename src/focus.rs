@@ -99,18 +99,6 @@ pub fn capture(_parent: Window) -> Option<Focus> {
     None
 }
 
-pub fn has_focus(target: &Widget) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(target.native_handle(), Some(NativeHandle::Win32(hwnd)) if unsafe { GetFocus() } == hwnd as isize)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        false
-    }
-}
-
 /// Re-establish keyboard focus after a modal dialog closes: the remembered
 /// control when one was captured, otherwise `fallback`. The restore is
 /// repeated from the event loop because Windows completes its activation

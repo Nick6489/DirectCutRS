@@ -1,4 +1,4 @@
-//! Let Tab and Shift+Tab leave multi-line edit fields.
+//! Native keyboard handling for read-only edit fields and push buttons.
 //!
 //! A multi-line EDIT control answers `WM_GETDLGCODE` by claiming the Tab key
 //! for itself, so once keyboard focus lands in one, Tab stops cycling: it
@@ -18,8 +18,8 @@ use std::sync::{Mutex, OnceLock};
 use rungui::{NativeHandle, TextArea};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DLGC_WANTCHARS, DefWindowProcW, GWL_STYLE, GWLP_WNDPROC, GetWindowLongPtrW,
-    SetWindowLongPtrW, WM_DESTROY, WM_GETDLGCODE, WS_TABSTOP,
+    CallWindowProcW, DLGC_WANTCHARS, DefWindowProcW, GWLP_WNDPROC, GetWindowLongPtrW,
+    SetWindowLongPtrW, WM_DESTROY, WM_GETDLGCODE,
 };
 
 /// The virtual-key code rungui's dialog manager queries when Tab is pressed.
@@ -78,32 +78,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     result
 }
 
-/// Remove the tab stop from a text view used as a display: keyboard focus
-/// cannot rest in it, so its text updates are not announced as character
-/// changes by a screen reader sitting in the field. The text stays visible
-/// and reviewable through the screen reader's window review.
-pub fn make_display_only(area: &TextArea) {
-    let Some(NativeHandle::Win32(hwnd)) = area.native_handle() else {
-        return;
-    };
-    unsafe {
-        let style = GetWindowLongPtrW(HWND(hwnd as isize), GWL_STYLE);
-        SetWindowLongPtrW(
-            HWND(hwnd as isize),
-            GWL_STYLE,
-            style & !(WS_TABSTOP.0 as isize),
-        );
+/// Let Enter activate a focused button in a Rungui top-level window.
+#[cfg(windows)]
+pub fn activate_on_enter(button: &rungui::Button) {
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+
+    if let Some(NativeHandle::Win32(hwnd)) = button.native_handle() {
+        unsafe { SetWindowSubclass(HWND(hwnd as isize), Some(button_proc), 0, 0) };
     }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn button_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BM_CLICK, DLGC_WANTMESSAGE, MSG, SendMessageW, WM_CHAR, WM_KEYDOWN, WM_NCDESTROY,
+    };
+
+    const VK_RETURN: usize = 0x0d;
+
+    match msg {
+        WM_GETDLGCODE if wparam.0 == VK_RETURN && lparam.0 != 0 => {
+            let key = unsafe { &*(lparam.0 as *const MSG) };
+            if key.message == WM_KEYDOWN || key.message == WM_CHAR {
+                // Rungui calls IsDialogMessage on its top-level window.
+                // Claim Enter before that call can consume it.
+                let flags = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+                return LRESULT(flags.0 | DLGC_WANTMESSAGE as isize);
+            }
+        }
+        WM_KEYDOWN if wparam.0 == VK_RETURN => {
+            if lparam.0 & (1 << 30) == 0 {
+                unsafe { SendMessageW(hwnd, BM_CLICK, WPARAM(0), LPARAM(0)) };
+            }
+            return LRESULT(0);
+        }
+        WM_CHAR if wparam.0 == VK_RETURN => return LRESULT(0),
+        WM_NCDESTROY => {
+            unsafe { RemoveWindowSubclass(hwnd, Some(button_proc), id) };
+        }
+        _ => {}
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{allow_tab_to_escape, make_display_only};
+    use super::allow_tab_to_escape;
     use rungui::{TextArea, WidgetId};
 
     #[test]
     fn styling_a_dead_field_does_nothing() {
         allow_tab_to_escape(&TextArea::from_id(WidgetId::DEAD));
-        make_display_only(&TextArea::from_id(WidgetId::DEAD));
     }
 }
