@@ -239,3 +239,131 @@ mod about {
         text.encode_utf16().chain([0]).collect()
     }
 }
+
+#[cfg(windows)]
+pub fn save_progress(
+    owner: Window,
+    progress: &crate::audio::SaveProgress,
+    worker: &std::thread::JoinHandle<()>,
+) {
+    use crate::audio::SaveStage;
+    use rungui::NativeHandle;
+    use windows::{
+        Win32::{
+            Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
+            System::LibraryLoader::GetModuleHandleW,
+            UI::{
+                Controls::{
+                    ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, InitCommonControlsEx, PBM_SETPOS,
+                },
+                WindowsAndMessaging::{
+                    DialogBoxParamW, EndDialog, GWLP_USERDATA, GetDlgItem, GetWindowLongPtrW,
+                    KillTimer, SendMessageW, SetDlgItemTextW, SetTimer, SetWindowLongPtrW,
+                    WM_CLOSE, WM_COMMAND, WM_INITDIALOG, WM_TIMER,
+                },
+            },
+        },
+        core::{PCWSTR, w},
+    };
+
+    const TIMER: usize = 1;
+    const STATUS: i32 = 1001;
+    const BAR: i32 = 1002;
+
+    struct State<'a> {
+        progress: &'a crate::audio::SaveProgress,
+        worker: &'a std::thread::JoinHandle<()>,
+        last: SaveStage,
+    }
+
+    unsafe extern "system" fn dialog(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
+        unsafe {
+            match message {
+                WM_INITDIALOG => {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, lparam.0);
+                    if SetTimer(hwnd, TIMER, 125, None) == 0 {
+                        let _ = EndDialog(hwnd, 0);
+                    }
+                    1
+                }
+                WM_TIMER if wparam.0 == TIMER => {
+                    let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State<'_>);
+                    if state.worker.is_finished() {
+                        let _ = KillTimer(hwnd, TIMER);
+                        let _ = EndDialog(hwnd, 0);
+                        return 1;
+                    }
+                    let stage = state.progress.stage();
+                    match (&state.last, &stage) {
+                        (SaveStage::Preparing, SaveStage::Writing(_)) => {
+                            let _ = SetDlgItemTextW(
+                                hwnd,
+                                STATUS,
+                                w!("Validating and writing audio..."),
+                            );
+                        }
+                        (SaveStage::Preparing | SaveStage::Writing(_), SaveStage::Finalizing) => {
+                            let _ = SetDlgItemTextW(hwnd, STATUS, w!("Finalizing the save..."));
+                        }
+                        _ => {}
+                    }
+                    let position = |stage: &SaveStage| match *stage {
+                        SaveStage::Preparing => 0,
+                        SaveStage::Writing(percent) => usize::from(percent),
+                        SaveStage::Finalizing => 99,
+                    };
+                    if position(&state.last) != position(&stage) {
+                        SendMessageW(
+                            GetDlgItem(hwnd, BAR),
+                            PBM_SETPOS,
+                            WPARAM(position(&stage)),
+                            LPARAM(0),
+                        );
+                    }
+                    state.last = stage;
+                    1
+                }
+                WM_CLOSE | WM_COMMAND => 1,
+                _ => 0,
+            }
+        }
+    }
+
+    if worker.is_finished() {
+        return;
+    }
+    let Some(NativeHandle::Win32(hwnd)) = owner.native_handle() else {
+        return;
+    };
+    let mut state = State {
+        progress,
+        worker,
+        last: SaveStage::Preparing,
+    };
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else {
+            return;
+        };
+        let controls = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_PROGRESS_CLASS,
+        };
+        if InitCommonControlsEx(&controls).as_bool() {
+            DialogBoxParamW(
+                HINSTANCE(module.0),
+                PCWSTR(104 as *const u16),
+                HWND(hwnd as isize),
+                Some(dialog),
+                LPARAM(&mut state as *mut State<'_> as isize),
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn save_progress(_: Window, _: &crate::audio::SaveProgress, _: &std::thread::JoinHandle<()>) {}

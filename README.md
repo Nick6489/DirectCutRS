@@ -79,7 +79,7 @@ Use **Titles > Cue Point** to rename, delete, or move a cue point. **Ctrl+Shift+
 
 Cue points move with the audio as you edit. A cue inside a cut is removed, and later cues move earlier. A cue right where the cut starts can stay at that spot. Cropping preserves cues within the kept audio and creates a title at the new beginning if the crop starts inside an existing title. All cue edits can be undone.
 
-Choose **Titles > Split Audio at Cue Points...** to export each title as its own file. The output names contain the track number and displayed title, such as `01 Intro - show.mp3`. Each track runs to the next cue, and the final track runs to the end of the recording. DirectCut warns if audio before the first cue would be omitted. Existing files are protected: if a name is already taken, DirectCut creates a numbered alternative rather than replacing it. The split does not re-encode the audio.
+Press **Ctrl+Shift+E** or choose **Titles > Split Audio at Cue Points...** to export each title as its own file. The output names contain the track number and displayed title, such as `01 Intro - show.mp3`. Each track runs to the next cue, and the final track runs to the end of the recording. DirectCut warns if audio before the first cue would be omitted. Existing files are protected: if a name is already taken, DirectCut creates a numbered alternative rather than replacing it. The split does not re-encode the audio.
 
 **Titles > Announce Titles While Playing** speaks track titles as playback reaches them. This can be particularly useful for checking long radio archives or mixes without repeatedly opening the title list.
 
@@ -161,6 +161,7 @@ In an editor window, press **F1** or choose **Help > Keyboard Shortcuts** to rea
 | Keys or command | Action |
 | --- | --- |
 | [ / ] | Mark selection start / end |
+| Ctrl+Shift+Home / Ctrl+Shift+End | Select between the playhead and the start / end of the recording |
 | Ctrl+[ / Ctrl+] | Move start marker backward / forward by one scrub step |
 | Alt+[ / Alt+] | Move end marker backward / forward by one scrub step |
 | Alt+Home / Alt+End | Jump to start / end marker |
@@ -188,7 +189,7 @@ In an editor window, press **F1** or choose **Help > Keyboard Shortcuts** to rea
 | Ctrl+Shift+M | Move nearest cue point to playhead |
 | Ctrl+Shift+B / Ctrl+Shift+F | Move all cues back / forward about one second |
 | Titles > Read Title List | Review title starts and lengths |
-| Titles > Split Audio at Cue Points... | Export one file per title |
+| Ctrl+Shift+E | Split audio at cue points and export one file per title |
 | Ctrl+I | Analyze the source MP3 |
 | F6 | View timeline status and recovery summary |
 | F1 | Read or save all keyboard shortcuts |

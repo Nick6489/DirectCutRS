@@ -3,7 +3,10 @@ use std::{
     io,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -115,8 +118,37 @@ fn decode_into(
     Ok(())
 }
 
-pub fn export(path: &Path, info: Info, frames: Frames) -> Result<()> {
-    write_export(path, info, frames, true).map(|_| ())
+#[derive(Default)]
+pub struct SaveProgress(AtomicU8);
+
+pub enum SaveStage {
+    Preparing,
+    Writing(u8),
+    Finalizing,
+}
+
+impl SaveProgress {
+    pub fn stage(&self) -> SaveStage {
+        match self.0.load(Ordering::Relaxed) {
+            0 => SaveStage::Preparing,
+            101 => SaveStage::Finalizing,
+            value => SaveStage::Writing(value - 1),
+        }
+    }
+
+    fn writing(&self, written: usize, total: usize) {
+        // Leave the last percent for flushing and committing the output.
+        let percent = (written.saturating_mul(100) / total.max(1)).min(99) as u8;
+        self.0.store(percent + 1, Ordering::Relaxed);
+    }
+
+    fn finalizing(&self) {
+        self.0.store(101, Ordering::Relaxed);
+    }
+}
+
+pub fn export(path: &Path, info: Info, frames: Frames, progress: &SaveProgress) -> Result<()> {
+    write_export(path, info, frames, true, progress).map(|_| ())
 }
 
 /// What [`export_no_replace`] did.
@@ -135,7 +167,7 @@ pub enum NoReplace {
 /// the caller can retry with the next free name. The split feature uses this
 /// to keep its promise that an existing file is never replaced.
 pub fn export_no_replace(path: &Path, info: Info, frames: Frames) -> Result<NoReplace> {
-    write_export(path, info, frames, false).map(|written| {
+    write_export(path, info, frames, false, &SaveProgress::default()).map(|written| {
         if written {
             NoReplace::Written(path.to_path_buf())
         } else {
@@ -144,10 +176,16 @@ pub fn export_no_replace(path: &Path, info: Info, frames: Frames) -> Result<NoRe
     })
 }
 
-fn write_export(path: &Path, info: Info, frames: Frames, replace: bool) -> Result<bool> {
+fn write_export(
+    path: &Path,
+    info: Info,
+    frames: Frames,
+    replace: bool,
+    progress: &SaveProgress,
+) -> Result<bool> {
     match info {
-        Info::Mp3 { format } => export_mp3(path, format, mp3_frames(&frames)?, replace),
-        _ => export_self_contained(path, info, frames, replace),
+        Info::Mp3 { format } => export_mp3(path, format, mp3_frames(&frames)?, replace, progress),
+        _ => export_self_contained(path, info, frames, replace, progress),
     }
 }
 
@@ -187,7 +225,9 @@ fn export_mp3(
     format: crate::mp3::Format,
     frames: Vec<Arc<crate::mp3::Frame>>,
     replace: bool,
+    progress: &SaveProgress,
 ) -> Result<bool> {
+    let total = frames.len();
     let info = Info::Mp3 { format };
     let mut packed = Packed::new(format, frames)?;
     let mut decoder = decoder(&info)?;
@@ -203,10 +243,15 @@ fn export_mp3(
         decode(decoder.as_mut(), &info, &index)?;
         decoder.reset();
         output.write_all(&index)?;
+        let mut written = 0;
+        progress.writing(0, total);
         while packed.next_frame(&mut packet) {
             decode(decoder.as_mut(), &info, &packet)?;
             output.write_all(&packet)?;
+            written += 1;
+            progress.writing(written, total);
         }
+        progress.finalizing();
         output.flush()?;
     }
     temp.as_file().sync_all()?;
@@ -216,7 +261,13 @@ fn export_mp3(
 /// Export frames that need no repacking: each frame is written byte-exactly
 /// and, when the stream's profile is decodable, validated by decoding it
 /// before the file commits.
-fn export_self_contained(path: &Path, info: Info, frames: Frames, replace: bool) -> Result<bool> {
+fn export_self_contained(
+    path: &Path,
+    info: Info,
+    frames: Frames,
+    replace: bool,
+    progress: &SaveProgress,
+) -> Result<bool> {
     let decodable = match info {
         Info::Aac { decodable, .. } => decodable,
         _ => true,
@@ -229,13 +280,16 @@ fn export_self_contained(path: &Path, info: Info, frames: Frames, replace: bool)
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     {
         let mut output = BufWriter::new(temp.as_file_mut());
-        for frame in &frames {
+        progress.writing(0, frames.len());
+        for (index, frame) in frames.iter().enumerate() {
             let bytes = frame.as_bytes()?;
             if let Some(decoder) = decoder.as_mut() {
                 decode(decoder.as_mut(), &info, bytes)?;
             }
             output.write_all(bytes)?;
+            progress.writing(index + 1, frames.len());
         }
+        progress.finalizing();
         output.flush()?;
     }
     temp.as_file().sync_all()?;
@@ -801,7 +855,7 @@ mod tests {
             .map(|frame| Arc::new(Frame::Mp3(frame)))
             .collect();
         let export_start = std::time::Instant::now();
-        export(&output, info, frames).unwrap();
+        export(&output, info, frames, &SaveProgress::default()).unwrap();
         let save = export_start.elapsed();
         let written = std::fs::metadata(&output).unwrap().len();
         eprintln!(

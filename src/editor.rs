@@ -3,14 +3,17 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, TryRecvError},
+    },
 };
 
 use rungui::*;
 
 use crate::{
     OpenDocument, Session, announce,
-    audio::{self, Playback},
+    audio::{self, Playback, SaveProgress},
     codec,
     codec::{Clipboard, Frames, Info, Timeline},
     editkeys, focus,
@@ -741,7 +744,7 @@ struct ExportOutcome {
 
 /// Why a save wrote no CUE sheet although markers were expected.
 enum NoCue {
-    /// No markers remain anywhere, so nothing needs writing.
+    /// An informational message when there are no pending CUE changes.
     Note(String),
     /// The destination keeps a CUE sheet this window did not write; it was
     /// preserved and its markers will resurface when the file is reopened.
@@ -818,6 +821,8 @@ enum Command {
     Delete,
     Crop,
     SelectAll,
+    SelectToFileStart,
+    SelectToFileEnd,
     Clear,
     Beginning,
     End,
@@ -1015,6 +1020,18 @@ fn name(path: &Path) -> String {
         .into_owned()
 }
 
+fn audio_destination(path: &Path, format: Info) -> PathBuf {
+    let extension = format.extension();
+    if path
+        .extension()
+        .is_some_and(|given| given.eq_ignore_ascii_case(extension))
+    {
+        path.to_path_buf()
+    } else {
+        path.with_extension(extension)
+    }
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     if let (Ok(left), Ok(right)) = (left.canonicalize(), right.canonicalize()) {
         return left == right;
@@ -1056,8 +1073,9 @@ fn export_with_cue(
     no_cue: Option<NoCue>,
     obsolete: Option<(PathBuf, Vec<u8>)>,
     expected_cue: Option<Vec<u8>>,
+    progress: &SaveProgress,
 ) -> ExportResult {
-    audio::export(path, format, frames).map_err(|error| error.to_string())?;
+    audio::export(path, format, frames, progress).map_err(|error| error.to_string())?;
     let mut outcome = ExportOutcome {
         cue: None,
         written_cue: None,
@@ -1226,6 +1244,10 @@ const HOTKEY_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("[ or ]", "Set the start or end marker at the playhead"),
             (
+                "Ctrl+Shift+Home or Ctrl+Shift+End",
+                "Select between the playhead and the start or end of the file",
+            ),
+            (
                 "Ctrl+[ or Ctrl+]",
                 "Move the start of the selection backward or forward one scrub step",
             ),
@@ -1275,7 +1297,7 @@ const HOTKEY_SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "Show every CUE title start and derived length",
             ),
             (
-                "Titles > Split Audio at Cue Points...",
+                "Ctrl+Shift+E",
                 "Write each CUE title's audio as its own numbered file in a chosen folder",
             ),
             (
@@ -1547,6 +1569,8 @@ fn create(path: PathBuf, opened: Opened, session: Session, open_document: OpenDo
         ("&Delete Selection", "Del", Delete),
         ("Crop to &Selection", "", Crop),
         ("Select &All", "Ctrl+A", SelectAll),
+        ("Select to File Start", "Ctrl+Shift+Home", SelectToFileStart),
+        ("Select to File End", "Ctrl+Shift+End", SelectToFileEnd),
         ("Clear Time Se&lection", "Esc", Clear),
     ][..]
     {
@@ -1617,7 +1641,7 @@ fn create(path: PathBuf, opened: Opened, session: Session, open_document: OpenDo
         ("&Next Title", "Ctrl+Shift+Right", NextTitle),
         ("&Go to Title...", "Ctrl+Shift+T", GoToTitle),
         ("&Read Title List", "", ReadTitles),
-        ("&Split Audio at Cue Points...", "", SplitTracks),
+        ("&Split Audio at Cue Points...", "Ctrl+Shift+E", SplitTracks),
     ][..]
     {
         add(titles, label, shortcut, command);
@@ -1786,7 +1810,8 @@ fn create(path: PathBuf, opened: Opened, session: Session, open_document: OpenDo
 
 fn can_close(editor: &RefCell<Editor>) -> bool {
     let (window, busy, message, dirty) = {
-        let editor = editor.borrow();
+        let mut editor = editor.borrow_mut();
+        editor.poll_save();
         let message = if editor.insert.is_some() {
             "Audio is being read for insertion. Close this window after it finishes."
         } else {
@@ -1946,6 +1971,87 @@ impl Editor {
         }
     }
 
+    fn poll_save(&mut self) {
+        if let Some(save) = &self.save {
+            match save.try_recv() {
+                Ok((path, revision, result)) => {
+                    self.save = None;
+                    match result {
+                        Ok(outcome) => {
+                            let message = saved_message(&path, &outcome);
+                            self.activity = message.clone();
+                            self.destination = Some(path);
+                            // A CUE write failure is not a successful save:
+                            // title markers may exist only in memory, so the
+                            // document stays dirty and closing still asks.
+                            if outcome.cue_error.is_none() {
+                                self.saved_revision = revision;
+                            }
+                            self.remember_cue_outcome(&outcome);
+                            self.speak(&message);
+                        }
+                        Err(error) => {
+                            self.activity = format!("Save failed. {error}");
+                            let window = self.window;
+                            let message = self.activity.clone();
+                            App::post(move || {
+                                if window.is_alive() {
+                                    show_error(window, &message);
+                                }
+                            });
+                        }
+                    }
+                    self.refresh();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.save = None;
+                    self.activity = "Save failed. The export worker stopped.".into();
+                    self.refresh();
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn poll_save_selection(&mut self) {
+        if let Some(selection) = &self.save_selection {
+            match selection.try_recv() {
+                Ok((path, result)) => {
+                    self.save_selection = None;
+                    match result {
+                        Ok(outcome) => {
+                            let message = format!(
+                                "Saved the selection to {}.{}",
+                                name(&path),
+                                cue_message(&outcome)
+                            );
+                            self.activity = message.clone();
+                            self.speak(&message);
+                            self.remember_cue_outcome(&outcome);
+                        }
+                        Err(error) => {
+                            self.activity = format!("Selection save failed. {error}");
+                            let window = self.window;
+                            let message = self.activity.clone();
+                            App::post(move || {
+                                if window.is_alive() {
+                                    show_error(window, &message);
+                                }
+                            });
+                        }
+                    }
+                    self.refresh();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.save_selection = None;
+                    self.activity = "Selection save failed. The export worker stopped.".into();
+                    self.refresh();
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     fn poll(&mut self) {
         let ended = self.playback.as_ref().is_some_and(|p| p.sink.empty());
         if ended {
@@ -1997,81 +2103,8 @@ impl Editor {
         } else if self.playback.is_none() {
             self.last_title = None;
         }
-        if let Some(save) = &self.save {
-            match save.try_recv() {
-                Ok((path, revision, result)) => {
-                    self.save = None;
-                    match result {
-                        Ok(outcome) => {
-                            let message = saved_message(&path, &outcome);
-                            self.activity = message.clone();
-                            self.speak(&message);
-                            self.destination = Some(path);
-                            // A CUE write failure is not a successful save:
-                            // title markers may exist only in memory, so the
-                            // document stays dirty and closing still asks.
-                            if outcome.cue_error.is_none() {
-                                self.saved_revision = revision;
-                            }
-                            self.remember_cue_outcome(&outcome);
-                        }
-                        Err(error) => {
-                            self.activity = format!("Save failed. {error}");
-                            let window = self.window;
-                            let message = self.activity.clone();
-                            App::post(move || {
-                                if window.is_alive() {
-                                    show_error(window, &message);
-                                }
-                            });
-                        }
-                    }
-                    self.refresh();
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.save = None;
-                    self.activity = "Save failed. The export worker stopped.".into();
-                    self.refresh();
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(selection) = &self.save_selection {
-            match selection.try_recv() {
-                Ok((path, result)) => {
-                    self.save_selection = None;
-                    match result {
-                        Ok(outcome) => {
-                            let message = format!(
-                                "Saved the selection to {}.{}",
-                                name(&path),
-                                cue_message(&outcome)
-                            );
-                            self.activity = message.clone();
-                            self.speak(&message);
-                            self.remember_cue_outcome(&outcome);
-                        }
-                        Err(error) => {
-                            self.activity = format!("Selection save failed. {error}");
-                            let window = self.window;
-                            let message = self.activity.clone();
-                            App::post(move || {
-                                if window.is_alive() {
-                                    show_error(window, &message);
-                                }
-                            });
-                        }
-                    }
-                    self.refresh();
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.save_selection = None;
-                    self.activity = "Selection save failed. The export worker stopped.".into();
-                    self.refresh();
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
+        self.poll_save();
+        self.poll_save_selection();
         if let Some(split) = &self.split {
             match split.try_recv() {
                 Ok(message) => {
@@ -2691,6 +2724,46 @@ impl Editor {
         self.next_revision += 1;
     }
 
+    fn choose_audio_destination(&self, title: &str, suggested: &str) -> Result<Option<PathBuf>> {
+        let Some(chosen) = self.modal(|| {
+            FileDialog::new()
+                .title(title)
+                .filter(&self.format.audio_label(), &[self.format.extension()])
+                .file_name(suggested)
+                .save(Some(self.window))
+        }) else {
+            return Ok(None);
+        };
+        let path = audio_destination(&chosen, self.format);
+        self.check_destination(&path)?;
+        // The file dialog can only confirm replacement of the name it returned.
+        if path != chosen {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let answer = self.modal(|| {
+                        message_box(
+                            Some(self.window),
+                            MessageKind::Warning,
+                            Buttons::OkCancel,
+                            "Replace audio file?",
+                            &format!(
+                                "This format saves as .{}. A file named {} already exists. Replace it?",
+                                self.format.extension(),
+                                name(&path),
+                            ),
+                        )
+                    });
+                    if answer != Answer::Ok {
+                        return Ok(None);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(Some(path))
+    }
+
     fn check_destination(&self, path: &Path) -> Result<()> {
         if same_path(path, &self.path) {
             return Err(
@@ -2774,22 +2847,16 @@ impl Editor {
                     .to_string_lossy(),
                 self.format.extension()
             );
-            let Some(path) = self.modal(|| {
-                FileDialog::new()
-                    .title("Save edited audio")
-                    .filter(&self.format.audio_label(), &[self.format.extension()])
-                    .file_name(&suggested)
-                    .save(Some(self.window))
-            }) else {
+            let Some(path) = self.choose_audio_destination("Save edited audio", &suggested)? else {
                 return Ok(());
             };
             path
         } else if let Some(destination) = self.destination.clone() {
+            self.check_destination(&destination)?;
             destination
         } else {
             return Err("Choose an output path for this save.".into());
         };
-        self.check_destination(&path)?;
         let format = self.format;
         let frames = self.edit.frames.clone();
         // A CUE is expected when the source had one, or when titles were
@@ -2807,10 +2874,19 @@ impl Editor {
                 obsolete = Some((existing, expected));
                 no_cue = Some(NoCue::Note("No title markers remain.".into()));
             } else if existing.exists() {
-                no_cue = Some(NoCue::LeftInPlace(format!(
+                let message = format!(
                     "The existing CUE sheet {} was left in place, so reopening this file will show its markers.",
                     name(&existing)
-                )));
+                );
+                let previously_saved_here = self
+                    .saved_cues
+                    .iter()
+                    .any(|(saved, _)| same_path(saved, &existing));
+                no_cue = Some(if cue_wanted || previously_saved_here {
+                    NoCue::LeftInPlace(message)
+                } else {
+                    NoCue::Note(message)
+                });
             } else if cue_wanted {
                 no_cue = Some(NoCue::Note(
                     "No CUE sheet was written: no title markers remain.".into(),
@@ -2847,15 +2923,27 @@ impl Editor {
         }
         let revision = self.edit.revision;
         let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+        let progress = Arc::new(SaveProgress::default());
+        let worker_progress = Arc::clone(&progress);
+        let worker = std::thread::Builder::new()
             .name("Audio export".into())
             .spawn(move || {
-                let result =
-                    export_with_cue(&path, format, frames, cue, no_cue, obsolete, expected_cue);
+                let result = export_with_cue(
+                    &path,
+                    format,
+                    frames,
+                    cue,
+                    no_cue,
+                    obsolete,
+                    expected_cue,
+                    &worker_progress,
+                );
                 let _ = sender.send((path, revision, result));
             })?;
         self.save = Some(receiver);
         self.activity = "Validating and saving audio...".into();
+        self.modal(|| crate::dialogs::save_progress(self.window, &progress, &worker));
+        self.poll_save();
         Ok(())
     }
 
@@ -2872,16 +2960,10 @@ impl Editor {
                 .to_string_lossy(),
             self.format.extension()
         );
-        let Some(path) = self.modal(|| {
-            FileDialog::new()
-                .title("Save selection as audio")
-                .filter(&self.format.audio_label(), &[self.format.extension()])
-                .file_name(&suggested)
-                .save(Some(self.window))
-        }) else {
+        let Some(path) = self.choose_audio_destination("Save selection as audio", &suggested)?
+        else {
             return Ok(());
         };
-        self.check_destination(&path)?;
         let format = self.format;
         let frames = self.edit.frames[range.clone()].to_vec();
         // Same rule as a full save: a CUE is expected when the source had one,
@@ -2936,15 +3018,27 @@ impl Editor {
             }
         }
         let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+        let progress = Arc::new(SaveProgress::default());
+        let worker_progress = Arc::clone(&progress);
+        let worker = std::thread::Builder::new()
             .name("Selection export".into())
             .spawn(move || {
-                let result =
-                    export_with_cue(&path, format, frames, cue, no_cue, obsolete, expected_cue);
+                let result = export_with_cue(
+                    &path,
+                    format,
+                    frames,
+                    cue,
+                    no_cue,
+                    obsolete,
+                    expected_cue,
+                    &worker_progress,
+                );
                 let _ = sender.send((path, result));
             })?;
         self.save_selection = Some(receiver);
         self.activity = "Validating and saving the selection...".into();
+        self.modal(|| crate::dialogs::save_progress(self.window, &progress, &worker));
+        self.poll_save_selection();
         Ok(())
     }
 
@@ -3870,6 +3964,19 @@ impl Editor {
                 self.edit.start = Some(0);
                 self.edit.end = Some(self.edit.frames.len());
             }
+            SelectToFileStart | SelectToFileEnd => {
+                let position = self.position();
+                let (start, end) = if matches!(command, SelectToFileStart) {
+                    (0, position)
+                } else {
+                    (position, self.edit.frames.len())
+                };
+                self.edit.start = (start < end).then_some(start);
+                self.edit.end = (start < end).then_some(end);
+                self.title_anchor = None;
+                self.freeze_status = false;
+                self.report_selection();
+            }
             Cut | Copy | Delete => {
                 let range = self.edit.selection()?;
                 let length = time_text(self.format, range.len());
@@ -4086,6 +4193,33 @@ mod tests {
     use crate::codec::{self, Frame, Frames};
     use std::{path::Path, sync::Arc};
 
+    #[test]
+    fn audio_save_names_match_the_export_format() {
+        let mp3 = Info::test(44_100, 2);
+        let mp2 = Info::Mp2 {
+            rate: 44_100,
+            channels: 2,
+        };
+        let aac = Info::Aac {
+            profile: 1,
+            rate: 44_100,
+            channels: 2,
+            decodable: true,
+        };
+        for (format, given, expected) in [
+            (mp3, "episode", "episode.mp3"),
+            (mp3, "episode.MP3", "episode.MP3"),
+            (mp3, "v1.2/episode.part1.wav", "v1.2/episode.part1.mp3"),
+            (mp2, "episode.mp3", "episode.mp2"),
+            (aac, "episode.m4a", "episode.aac"),
+        ] {
+            assert_eq!(
+                super::audio_destination(Path::new(given), format),
+                Path::new(expected)
+            );
+        }
+    }
+
     fn marker(frame: usize, title: &str) -> TitleMarker {
         TitleMarker {
             frame,
@@ -4158,7 +4292,17 @@ mod tests {
             directory.path().join("missing").join("show.cue"),
             vec![(0.0, "A".to_string())],
         ));
-        let outcome = export_with_cue(&audio, info, frames.clone(), cue, None, None, None).unwrap();
+        let outcome = export_with_cue(
+            &audio,
+            info,
+            frames.clone(),
+            cue,
+            None,
+            None,
+            None,
+            &crate::audio::SaveProgress::default(),
+        )
+        .unwrap();
         assert!(outcome.cue.is_none());
         assert!(outcome.cue_error.as_deref().unwrap().contains("show.cue"));
         assert_eq!(std::fs::read(&audio).unwrap(), vec![1, 2]);
@@ -4189,6 +4333,7 @@ mod tests {
             )),
             Some((stale.clone(), b"old markers".to_vec())),
             None,
+            &crate::audio::SaveProgress::default(),
         )
         .unwrap();
         assert_eq!(outcome.removed_cue.as_deref(), Some(stale.as_path()));
@@ -4205,6 +4350,7 @@ mod tests {
             )),
             None,
             None,
+            &crate::audio::SaveProgress::default(),
         )
         .unwrap();
         assert!(outcome.removed_cue.is_none());

@@ -522,8 +522,13 @@ mod real_files {
 
             let directory = tempfile::tempdir().unwrap();
             let output = directory.path().join(name);
-            crate::audio::export(&output, timeline.info, timeline.frames)
-                .unwrap_or_else(|error| panic!("{name}: export: {error}"));
+            crate::audio::export(
+                &output,
+                timeline.info,
+                timeline.frames,
+                &crate::audio::SaveProgress::default(),
+            )
+            .unwrap_or_else(|error| panic!("{name}: export: {error}"));
             let saved = std::fs::read(&output).unwrap();
             let reopened = open(&saved).unwrap_or_else(|error| panic!("{name}: reopen: {error}"));
             assert!(

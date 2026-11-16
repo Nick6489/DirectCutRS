@@ -1392,7 +1392,13 @@ mod tests {
                 .into_iter()
                 .map(|frame| std::sync::Arc::new(crate::codec::Frame::Mp3(frame)))
                 .collect();
-            crate::audio::export(&output, crate::codec::Info::Mp3 { format }, frames).unwrap();
+            crate::audio::export(
+                &output,
+                crate::codec::Info::Mp3 { format },
+                frames,
+                &crate::audio::SaveProgress::default(),
+            )
+            .unwrap();
             let (actual_format, actual, recovery) = parse(&std::fs::read(output).unwrap()).unwrap();
             assert_eq!(actual_format, format);
             assert_eq!(recovery, Recovery::default());
