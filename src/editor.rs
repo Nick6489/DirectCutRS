@@ -943,6 +943,16 @@ fn clipboard_file_paths() -> Vec<PathBuf> {
 }
 
 pub fn open_file(parent: Window, path: PathBuf, session: &Session) {
+    let path = match std::path::absolute(&path) {
+        Ok(absolute) => absolute,
+        Err(error) => {
+            show_error(
+                parent,
+                &format!("Could not open {}. {error}", path.display()),
+            );
+            return;
+        }
+    };
     let (sender, receiver) = mpsc::channel();
     let input = path.clone();
     let started = std::thread::Builder::new()
@@ -2726,11 +2736,15 @@ impl Editor {
 
     fn choose_audio_destination(&self, title: &str, suggested: &str) -> Result<Option<PathBuf>> {
         let Some(chosen) = self.modal(|| {
-            FileDialog::new()
+            let dialog = FileDialog::new()
                 .title(title)
                 .filter(&self.format.audio_label(), &[self.format.extension()])
-                .file_name(suggested)
-                .save(Some(self.window))
+                .file_name(suggested);
+            let dialog = match self.path.parent() {
+                Some(folder) => dialog.directory(&folder.to_string_lossy()),
+                None => dialog,
+            };
+            dialog.save(Some(self.window))
         }) else {
             return Ok(None);
         };
