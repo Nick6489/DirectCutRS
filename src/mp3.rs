@@ -110,21 +110,27 @@ fn header_format(h: [u8; 4]) -> Result<Format> {
     })
 }
 
-fn part_lengths(side: &[u8], format: Format) -> usize {
+fn part_lengths(side: &[u8], format: Format) -> impl DoubleEndedIterator<Item = usize> + '_ {
     let mono = format.channels == 1;
     let (start, stride, count) = if format.version == 3 {
         (if mono { 18 } else { 20 }, 59, format.channels * 2)
     } else {
         (if mono { 9 } else { 10 }, 63, format.channels)
     };
-    (0..count as usize)
-        .map(|part| {
-            let offset = start + stride * part;
-            (offset..offset + 12).fold(0, |value, bit| {
-                (value << 1) | usize::from((side[bit / 8] >> (7 - bit % 8)) & 1)
-            })
+    (0..count as usize).map(move |part| {
+        let offset = start + stride * part;
+        (offset..offset + 12).fold(0, |value, bit| {
+            (value << 1) | usize::from((side[bit / 8] >> (7 - bit % 8)) & 1)
         })
-        .sum()
+    })
+}
+
+fn needs_trailing_byte(format: Format, side: &[u8]) -> bool {
+    // Symphonia starts a bit reader for every granule/channel, even when its
+    // length is zero. Leave a byte in the packet when that reader would start
+    // exactly at the end of the main data. The next frame may use that byte.
+    let mut lengths = part_lengths(side, format);
+    lengths.next_back() == Some(0) && lengths.sum::<usize>().is_multiple_of(8)
 }
 
 /// Every event worth telling an archivist about, with exact byte offsets into the
@@ -680,7 +686,7 @@ fn run(bytes: &[u8], keep: bool) -> Result<Scan> {
         } else {
             usize::from(side[0])
         };
-        let bits = part_lengths(side, format);
+        let bits: usize = part_lengths(side, format).sum();
         let is_index = stream_start
             && bits == 0
             && (slot.starts_with(b"Xing")
@@ -831,6 +837,7 @@ impl Packed {
         for (index, frame) in frames.iter().enumerate() {
             let start = previous_end.max(slot.saturating_sub(format.reservoir()));
             let data_end = start + frame.data.len();
+            let required_end = data_end + usize::from(needs_trailing_byte(format, &frame.side));
             let mut header = frame.header;
             header[1] |= 1; // Rewritten side information uses a header without a CRC.
             let original_rate = if max_capacity {
@@ -842,8 +849,15 @@ impl Packed {
             let (bitrate, padded, end) = (original_rate..=14)
                 .map(|rate| (rate, padded))
                 .chain((!padded).then_some((14, true)))
-                .map(|(rate, pad)| (rate, pad, slot + format.frame_len(rate, pad) - overhead))
-                .find(|(_, _, end)| *end >= data_end)
+                .map(|(rate, pad)| {
+                    let end = slot + format.frame_len(rate, pad) - overhead;
+                    if !pad && end == data_end && end < required_end {
+                        (rate, true, end + 1)
+                    } else {
+                        (rate, pad, end)
+                    }
+                })
+                .find(|(_, _, end)| *end >= required_end)
                 .ok_or_else(|| {
                     invalid(format!(
                         "Frame {} needs more MP3 reservoir space. Move the edit boundary earlier.",
@@ -931,7 +945,8 @@ impl Packed {
 }
 
 pub fn can_start(format: Format, frame: &Frame) -> bool {
-    frame.data.len() <= format.frame_len(14, true) - 4 - format.side_len()
+    frame.data.len() + usize::from(needs_trailing_byte(format, &frame.side))
+        <= format.frame_len(14, true) - 4 - format.side_len()
 }
 
 #[cfg(test)]
@@ -995,6 +1010,37 @@ mod tests {
     }
 
     #[test]
+    fn packs_byte_aligned_main_data_followed_by_empty_channels() {
+        let header = test_header();
+        let format = header_format(header).unwrap();
+        let data = vec![0; format.frame_len(9, false) - 4 - format.side_len()];
+        let mut input = frame(header, 0, &data);
+        input.extend(stream(header, 3));
+        let (_, frames, recovery) = parse(&input).unwrap();
+        assert_eq!(recovery, Recovery::default());
+        let mut packed = Packed::new(format, frames.clone()).unwrap();
+        let info = crate::codec::Info::Mp3 { format };
+        let mut decoder = crate::audio::decoder(&info).unwrap();
+        let mut packet = Vec::new();
+        let mut output = Vec::new();
+        assert!(packed.next_frame(&mut packet));
+        assert_eq!(packet[2], header[2] | 2);
+        loop {
+            crate::audio::decode(decoder.as_mut(), &info, &packet).unwrap();
+            output.extend_from_slice(&packet);
+            if !packed.next_frame(&mut packet) {
+                break;
+            }
+        }
+        let (_, repacked, recovery) = parse(&output).unwrap();
+        assert_eq!(recovery, Recovery::default());
+        assert_eq!(repacked.len(), frames.len());
+        for (original, repacked) in frames.iter().zip(&repacked) {
+            assert_eq!(repacked.data, original.data);
+        }
+    }
+
+    #[test]
     fn splice_moves_main_data_across_frame_boundaries() {
         let header = [0xff, 0xfb, 0x90, 0];
         let format = header_format(header).unwrap();
@@ -1022,10 +1068,7 @@ mod tests {
         assert_eq!(output.len(), frames.len());
         for (expected, actual) in frames.iter().zip(&output) {
             assert_eq!(expected.data, actual.data);
-            assert_eq!(
-                part_lengths(&expected.side, format),
-                part_lengths(&actual.side, format)
-            );
+            assert!(part_lengths(&expected.side, format).eq(part_lengths(&actual.side, format)));
         }
         assert_ne!(output[1].side[0], 0);
     }
